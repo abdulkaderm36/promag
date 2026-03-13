@@ -206,7 +206,10 @@ func newTheme() theme {
 			Border(lipgloss.NormalBorder(), true, false, false, false).
 			BorderForeground(lipgloss.Color("#20334D")).
 			Padding(0, 1),
-		title:        lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F5FAFF")),
+		title: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#F5FAFF")).
+			Padding(0, 1),
 		subtitle:     lipgloss.NewStyle().Foreground(lipgloss.Color("#93A4B8")),
 		eyebrow:      lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7FDBB6")),
 		sectionTitle: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D6E4F3")),
@@ -218,6 +221,7 @@ func newTheme() theme {
 		tabActive: lipgloss.NewStyle().
 			Bold(true).
 			Padding(0, 1).
+			Background(lipgloss.Color("#14263B")).
 			Foreground(lipgloss.Color("#7FDBB6")).
 			Underline(true),
 		inputLabel:      lipgloss.NewStyle().Foreground(lipgloss.Color("#93A4B8")),
@@ -707,7 +711,9 @@ func (m model) renderHeader() string {
 		viewHelp:    "4 Guide",
 	}
 
-	tabY := 3
+	logo := m.renderLogo(contentWidth)
+	logoHeight := lipgloss.Height(logo)
+	tabY := logoHeight + 2
 	x := 0
 	tabParts := make([]string, 0, len(views))
 	for _, v := range views {
@@ -722,35 +728,21 @@ func (m model) renderHeader() string {
 		x += w + 1
 		tabParts = append(tabParts, rendered)
 	}
-
-	stats := []string{
+	tabsLine := strings.Join(tabParts, " ")
+	statsLine := lipgloss.JoinHorizontal(
+		lipgloss.Top,
 		m.renderMetric("Open", fmt.Sprintf("%d", m.openTaskCount()), ui.warn),
 		m.renderMetric("Done", fmt.Sprintf("%d", m.doneTaskCount()), ui.success),
 		m.renderMetric("Overdue", fmt.Sprintf("%d", m.overdueTaskCount()), ui.danger),
 		m.renderMetric("People", fmt.Sprintf("%d", len(m.state.Members)), ui.borderStrong),
-	}
-	statsLine := lipgloss.JoinHorizontal(lipgloss.Top, stats...)
-	brandLine := lipgloss.JoinHorizontal(
-		lipgloss.Center,
-		ui.title.Render(appTitle),
-		" ",
-		ui.subtitle.Render("project board"),
 	)
-	tabsLine := strings.Join(tabParts, " ")
 	if lipgloss.Width(tabsLine) > contentWidth {
 		tabsLine = ui.subtitle.Render("1-4 switch views")
 	}
 
-	lines := []string{}
-	if lipgloss.Width(brandLine)+lipgloss.Width(statsLine)+2 <= contentWidth {
-		lines = append(lines, joinHeaderLine(brandLine, statsLine, contentWidth))
-	} else {
-		lines = append(lines, truncate(brandLine, contentWidth))
-		lines = append(lines, truncate(statsLine, contentWidth))
-		tabY = 4
-	}
+	lines := []string{logo}
 	lines = append(lines, "")
-	lines = append(lines, tabsLine)
+	lines = append(lines, joinHeaderLine(tabsLine, statsLine, contentWidth))
 	return ui.headerFrame.Width(frameWidth).Render(strings.Join(lines, "\n"))
 }
 
@@ -862,9 +854,9 @@ func (m model) detailContent() string {
 func (m model) renderStatus() string {
 	frameWidth := max(20, m.width)
 	contentWidth := max(20, frameWidth-ui.statusFrame.GetHorizontalFrameSize())
-	left := ui.title.Render(truncate(m.lastStatus, max(10, contentWidth-48)))
-	filter := ui.subtitle.Render(truncate(m.filterSummary(), max(20, contentWidth/3)))
-	right := lipgloss.JoinHorizontal(
+	left := ui.title.Render(truncate(m.lastStatus, max(10, contentWidth/2)))
+	center := ui.subtitle.Render(truncate(m.filterSummary(), max(16, contentWidth/3)))
+	hints := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		ui.keycap.Render("f"),
 		" filter ",
@@ -877,14 +869,12 @@ func (m model) renderStatus() string {
 		ui.keycap.Render("q"),
 		" quit",
 	)
-	row := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		left,
-		strings.Repeat(" ", max(1, contentWidth-lipgloss.Width(left)-lipgloss.Width(filter)-lipgloss.Width(right)-2)),
-		filter,
-		"  ",
-		right,
-	)
+	right := hints
+	leftBlock := left
+	if strings.TrimSpace(m.filter.Text+m.filter.Member+m.filter.Due) != "" {
+		leftBlock = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", center)
+	}
+	row := joinHeaderLine(leftBlock, right, contentWidth)
 	return ui.statusFrame.Width(frameWidth).Render(row)
 }
 
@@ -2099,14 +2089,37 @@ func helpManual() string {
 }
 
 func (m model) renderMetric(label, value string, accent lipgloss.Color) string {
-	return lipgloss.NewStyle().MarginLeft(1).Render(
-		lipgloss.JoinHorizontal(
-			lipgloss.Center,
-			ui.metricLabel.Render(label),
-			" ",
-			ui.metricValue.Foreground(accent).Render(value),
-		),
-	)
+	return lipgloss.NewStyle().
+		MarginLeft(1).
+		Padding(0, 1).
+		Background(ui.panelAlt).
+		Foreground(ui.text).
+		Render(
+			lipgloss.JoinHorizontal(
+				lipgloss.Center,
+				ui.metricLabel.Render(strings.ToUpper(label)),
+				" ",
+				ui.metricValue.Foreground(accent).Render(value),
+			),
+		)
+}
+
+func (m model) renderLogo(width int) string {
+	lines := []string{
+		"█▀█ █▀█ █▀█ █▀▄▀█ ▄▀█ █▀▀",
+		"█▀▀ █▀▄ █▄█ █ ▀ █ █▀█ █▄█",
+	}
+	rendered := make([]string, 0, len(lines))
+	for i, line := range lines {
+		style := lipgloss.NewStyle().Width(width).Align(lipgloss.Center)
+		if i == 0 {
+			style = style.Foreground(ui.text).Bold(true)
+		} else {
+			style = style.Foreground(ui.accent)
+		}
+		rendered = append(rendered, style.Render(line))
+	}
+	return strings.Join(rendered, "\n")
 }
 
 func (m model) openTaskCount() int {
