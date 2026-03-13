@@ -1,0 +1,1905 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+const (
+	appTitle     = "ProMag"
+	dateLayout   = "2006-01-02"
+	storageFile  = "promag-data.json"
+	minLeftWidth = 40
+)
+
+type viewMode string
+
+const (
+	viewTasks   viewMode = "tasks"
+	viewMembers viewMode = "members"
+	viewDates   viewMode = "dates"
+	viewHelp    viewMode = "help"
+)
+
+type overlayMode string
+
+const (
+	overlayNone   overlayMode = ""
+	overlayMember overlayMode = "member"
+	overlayTask   overlayMode = "task"
+	overlayNote   overlayMode = "note"
+	overlayFilter overlayMode = "filter"
+)
+
+type zone struct {
+	X1 int
+	Y1 int
+	X2 int
+	Y2 int
+	ID string
+}
+
+type member struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+	Email string `json:"email"`
+}
+
+type task struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	MemberID  string    `json:"member_id"`
+	Category  string    `json:"category"`
+	Priority  string    `json:"priority"`
+	Tags      []string  `json:"tags"`
+	Comments  []string  `json:"comments"`
+	DueDate   string    `json:"due_date"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type appState struct {
+	Members []member `json:"members"`
+	Tasks   []task   `json:"tasks"`
+}
+
+type row struct {
+	Title    string
+	Subtitle string
+	ID       string
+}
+
+type model struct {
+	dataPath string
+	state    appState
+
+	width   int
+	height  int
+	bodyTop int
+
+	activeView viewMode
+	cursor     map[viewMode]int
+	lastStatus string
+	statusAt   time.Time
+
+	tabZones []zone
+	rowZones []zone
+
+	overlay overlayMode
+
+	memberInputs []textinput.Model
+	taskInputs   []textinput.Model
+	filterInputs []textinput.Model
+	noteInput    textarea.Model
+	formCursor   int
+
+	pendingG bool
+	filter   filterState
+}
+
+type filterState struct {
+	Text   string
+	Member string
+	Due    string
+}
+
+func main() {
+	path := filepath.Join(".", storageFile)
+	state, err := loadState(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load state: %v\n", err)
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(
+		newModel(path, state),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		tea.WithMouseAllMotion(),
+	)
+
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "run app: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newModel(path string, state appState) model {
+	memberInputs := make([]textinput.Model, 3)
+	memberPlaceholders := []string{"Member name", "Role or specialty", "Email or handle"}
+	for i := range memberInputs {
+		in := textinput.New()
+		in.Placeholder = memberPlaceholders[i]
+		in.Prompt = ""
+		in.CharLimit = 128
+		memberInputs[i] = in
+	}
+	memberInputs[0].Focus()
+
+	taskInputs := make([]textinput.Model, 7)
+	taskPlaceholders := []string{
+		"Task title",
+		"Members: ali,sara",
+		"Category: backend, design, ops",
+		"Priority: low, medium, high, urgent",
+		"Tags: api,bug,release",
+		"Due date: 2026-03-20",
+		"Comments: first note | another note",
+	}
+	for i := range taskInputs {
+		in := textinput.New()
+		in.Placeholder = taskPlaceholders[i]
+		in.Prompt = ""
+		in.CharLimit = 256
+		taskInputs[i] = in
+	}
+	taskInputs[0].Focus()
+
+	filterInputs := make([]textinput.Model, 3)
+	filterPlaceholders := []string{
+		"Text in title, category, tags, comments",
+		"Member name",
+		"Due date: 2026-03-20",
+	}
+	for i := range filterInputs {
+		in := textinput.New()
+		in.Placeholder = filterPlaceholders[i]
+		in.Prompt = ""
+		in.CharLimit = 256
+		filterInputs[i] = in
+	}
+
+	noteInput := textarea.New()
+	noteInput.Placeholder = notePlaceholder()
+	noteInput.SetWidth(80)
+	noteInput.SetHeight(14)
+	noteInput.Focus()
+
+	return model{
+		dataPath:     path,
+		state:        state,
+		activeView:   viewTasks,
+		cursor:       map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewHelp: 0},
+		memberInputs: memberInputs,
+		taskInputs:   taskInputs,
+		filterInputs: filterInputs,
+		noteInput:    noteInput,
+		lastStatus:   "Ready. Press ? for the full manual.",
+		statusAt:     time.Now(),
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return textinput.Blink
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.resizeEditors()
+		return m, nil
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+	case tea.KeyMsg:
+		if m.overlay != overlayNone {
+			return m.handleOverlayKey(msg)
+		}
+		return m.handleNormalKey(msg)
+	}
+
+	return m, nil
+}
+
+func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress {
+		if msg.Button == tea.MouseButtonWheelUp {
+			return m.moveCursor(-1), nil
+		}
+		if msg.Button == tea.MouseButtonWheelDown {
+			return m.moveCursor(1), nil
+		}
+		return m, nil
+	}
+
+	if msg.Button == tea.MouseButtonWheelUp {
+		return m.moveCursor(-1), nil
+	}
+	if msg.Button == tea.MouseButtonWheelDown {
+		return m.moveCursor(1), nil
+	}
+	if msg.Button != tea.MouseButtonLeft || m.overlay != overlayNone {
+		return m, nil
+	}
+
+	for _, z := range m.tabZones {
+		if inZone(msg.X, msg.Y, z) {
+			m.activeView = viewMode(z.ID)
+			m.pendingG = false
+			return m, nil
+		}
+	}
+
+	for i, z := range m.rowZones {
+		if inZone(msg.X, msg.Y, z) {
+			m.cursor[m.activeView] = i
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.overlay {
+	case overlayMember:
+		return m.handleMemberForm(msg)
+	case overlayTask:
+		return m.handleTaskForm(msg)
+	case overlayNote:
+		return m.handleNoteForm(msg)
+	case overlayFilter:
+		return m.handleFilterForm(msg)
+	default:
+		return m, nil
+	}
+}
+
+func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "?":
+		m.activeView = viewHelp
+		m.setStatus("Manual opened.")
+		return m, nil
+	case "1":
+		m.activeView = viewTasks
+		return m, nil
+	case "2":
+		m.activeView = viewMembers
+		return m, nil
+	case "3":
+		m.activeView = viewDates
+		return m, nil
+	case "4":
+		m.activeView = viewHelp
+		return m, nil
+	case "tab", "l", "right":
+		m.nextView()
+		return m, nil
+	case "shift+tab", "h", "left":
+		m.prevView()
+		return m, nil
+	case "j", "down":
+		return m.moveCursor(1), nil
+	case "k", "up":
+		return m.moveCursor(-1), nil
+	case "g":
+		if m.pendingG {
+			m.cursor[m.activeView] = 0
+			m.pendingG = false
+			return m, nil
+		}
+		m.pendingG = true
+		return m, nil
+	case "G":
+		m.cursor[m.activeView] = max(0, len(m.rowsForView())-1)
+		m.pendingG = false
+		return m, nil
+	case "a":
+		if m.activeView == viewMembers {
+			m.openMemberForm()
+			return m, nil
+		}
+		m.openTaskForm("")
+		return m, nil
+	case "m":
+		m.openMemberForm()
+		return m, nil
+	case "t":
+		m.openTaskForm(m.prefillMemberNames())
+		return m, nil
+	case "n":
+		m.openNoteForm()
+		return m, nil
+	case "/", "f":
+		m.openFilterForm()
+		return m, nil
+	case "F":
+		m.clearFilters()
+		return m, nil
+	case " ":
+		if m.activeView == viewTasks {
+			return m.toggleSelectedTask(), nil
+		}
+		return m, nil
+	case "x":
+		return m.deleteSelected(), nil
+	}
+
+	m.pendingG = false
+	return m, nil
+}
+
+func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Member entry cancelled.")
+		return m, nil
+	case "tab", "shift+tab", "enter", "up", "down", "j", "k":
+		s := msg.String()
+		if s == "enter" && m.formCursor == len(m.memberInputs)-1 {
+			if err := m.submitMemberForm(); err != nil {
+				m.setStatus(err.Error())
+				return m, nil
+			}
+			m.closeOverlay("Member saved.")
+			return m, nil
+		}
+		m.navigateForm(len(m.memberInputs), s)
+		return m, nil
+	case "ctrl+s":
+		if err := m.submitMemberForm(); err != nil {
+			m.setStatus(err.Error())
+			return m, nil
+		}
+		m.closeOverlay("Member saved.")
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.memberInputs[m.formCursor], cmd = m.memberInputs[m.formCursor].Update(msg)
+	return m, cmd
+}
+
+func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Task entry cancelled.")
+		return m, nil
+	case "tab", "shift+tab", "up", "down", "j", "k":
+		m.navigateForm(len(m.taskInputs), msg.String())
+		return m, nil
+	case "enter":
+		if m.formCursor == len(m.taskInputs)-1 {
+			if err := m.submitTaskForm(); err != nil {
+				m.setStatus(err.Error())
+				return m, nil
+			}
+			m.closeOverlay("Task saved.")
+			return m, nil
+		}
+		m.navigateForm(len(m.taskInputs), "tab")
+		return m, nil
+	case "ctrl+s":
+		if err := m.submitTaskForm(); err != nil {
+			m.setStatus(err.Error())
+			return m, nil
+		}
+		m.closeOverlay("Task saved.")
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.taskInputs[m.formCursor], cmd = m.taskInputs[m.formCursor].Update(msg)
+	return m, cmd
+}
+
+func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Quick note capture cancelled.")
+		return m, nil
+	case "ctrl+s":
+		count, err := m.submitNoteForm()
+		if err != nil {
+			m.setStatus(err.Error())
+			return m, nil
+		}
+		m.closeOverlay(fmt.Sprintf("%d task(s) created from note capture.", count))
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.noteInput, cmd = m.noteInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Filter edit cancelled.")
+		return m, nil
+	case "tab", "shift+tab", "up", "down", "j", "k":
+		m.navigateForm(len(m.filterInputs), msg.String())
+		return m, nil
+	case "enter":
+		if m.formCursor == len(m.filterInputs)-1 {
+			if err := m.submitFilterForm(); err != nil {
+				m.setStatus(err.Error())
+				return m, nil
+			}
+			m.closeOverlay(m.filterSummary())
+			return m, nil
+		}
+		m.navigateForm(len(m.filterInputs), "tab")
+		return m, nil
+	case "ctrl+s":
+		if err := m.submitFilterForm(); err != nil {
+			m.setStatus(err.Error())
+			return m, nil
+		}
+		m.closeOverlay(m.filterSummary())
+		return m, nil
+	case "ctrl+r":
+		m.clearFilters()
+		m.closeOverlay("Filters cleared.")
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.filterInputs[m.formCursor], cmd = m.filterInputs[m.formCursor].Update(msg)
+	return m, cmd
+}
+
+func (m model) View() string {
+	if m.width == 0 || m.height == 0 {
+		return "loading..."
+	}
+
+	m.tabZones = nil
+	m.rowZones = nil
+
+	header := m.renderHeader()
+	m.bodyTop = lipgloss.Height(header)
+	status := m.renderStatus()
+	bodyHeight := max(8, m.height-lipgloss.Height(header)-lipgloss.Height(status)-1)
+	body := m.renderBody(bodyHeight)
+
+	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
+	if m.overlay != overlayNone {
+		screen = screen + "\n" + m.renderOverlay()
+	}
+	return screen
+}
+
+func (m model) renderHeader() string {
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F2F4F8"))
+	subStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+	tabActive := lipgloss.NewStyle().
+		Bold(true).
+		Padding(0, 1).
+		Foreground(lipgloss.Color("#111827")).
+		Background(lipgloss.Color("#A7C7E7"))
+	tabIdle := lipgloss.NewStyle().
+		Padding(0, 1).
+		Foreground(lipgloss.Color("#AEB7C4")).
+		Background(lipgloss.Color("#1D2735"))
+
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	labels := map[viewMode]string{
+		viewTasks:   "1 Tasks",
+		viewMembers: "2 Members",
+		viewDates:   "3 Due Dates",
+		viewHelp:    "4 Help",
+	}
+
+	tabY := 1
+	x := 0
+	tabParts := make([]string, 0, len(views))
+	for _, v := range views {
+		label := labels[v]
+		style := tabIdle
+		if m.activeView == v {
+			style = tabActive
+		}
+		rendered := style.Render(label)
+		w := lipgloss.Width(rendered)
+		m.tabZones = append(m.tabZones, zone{X1: x, Y1: tabY, X2: x + w - 1, Y2: tabY, ID: string(v)})
+		x += w + 1
+		tabParts = append(tabParts, rendered)
+	}
+
+	line1 := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		titleStyle.Render(appTitle),
+		"  ",
+		subStyle.Render("simple project management for teams"),
+	)
+	line2 := strings.Join(tabParts, " ")
+	return lipgloss.JoinVertical(lipgloss.Left, line1, line2)
+}
+
+func (m model) renderBody(bodyHeight int) string {
+	leftWidth := max(minLeftWidth, min(m.width/2-1, 48))
+	if leftWidth > m.width-32 {
+		leftWidth = max(28, m.width/2)
+	}
+	rightWidth := max(30, m.width-leftWidth-3)
+
+	rows := m.rowsForView()
+	m.clampCursor(len(rows))
+	selected := min(max(m.cursor[m.activeView], 0), max(0, len(rows)-1))
+
+	left := m.renderList(rows, leftWidth, bodyHeight, selected)
+	right := m.renderDetail(rightWidth, bodyHeight)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, "   ", right)
+}
+
+func (m model) renderList(rows []row, width, height, selected int) string {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#324154")).
+		Padding(0, 1).
+		Width(width).
+		Height(height)
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D7E3F0"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#F9FAFB")).
+		Background(lipgloss.Color("#243447")).
+		Padding(0, 1)
+	idleStyle := lipgloss.NewStyle().Padding(0, 1)
+
+	title := map[viewMode]string{
+		viewTasks:   "Task View",
+		viewMembers: "Member View",
+		viewDates:   "Due Date View",
+		viewHelp:    "Manual",
+	}[m.activeView]
+
+	lines := []string{titleStyle.Render(title), muted.Render(m.listHint()), ""}
+	startY := m.bodyTop + 3
+	y := startY
+
+	if len(rows) == 0 {
+		lines = append(lines, muted.Render("No records yet. Use a, m, t, or n."))
+		return box.Render(strings.Join(lines, "\n"))
+	}
+
+	maxRows := max(1, height-4)
+	offset := 0
+	if selected >= maxRows {
+		offset = selected - maxRows + 1
+	}
+
+	for idx := offset; idx < len(rows) && idx < offset+maxRows; idx++ {
+		r := rows[idx]
+		line := fmt.Sprintf("%-2d %s", idx+1, r.Title)
+		if idx == selected {
+			line = selectedStyle.Width(width - 4).Render(line)
+		} else {
+			line = idleStyle.Width(width - 4).Render(line)
+		}
+		lines = append(lines, line)
+		if idx == selected && strings.TrimSpace(r.Subtitle) != "" {
+			lines = append(lines, muted.Render("   "+truncate(r.Subtitle, width-6)))
+			m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + 1, ID: r.ID})
+			y += 2
+			continue
+		}
+		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y, ID: r.ID})
+		y++
+	}
+
+	return box.Render(strings.Join(lines, "\n"))
+}
+
+func (m model) renderDetail(width, height int) string {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#324154")).
+		Padding(0, 1).
+		Width(width).
+		Height(height)
+
+	content := ""
+	switch m.activeView {
+	case viewTasks:
+		content = m.taskDetail()
+	case viewMembers:
+		content = m.memberDetail()
+	case viewDates:
+		content = m.dateDetail()
+	case viewHelp:
+		content = helpManual()
+	}
+	return box.Render(content)
+}
+
+func (m model) renderStatus() string {
+	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#E5ECF4"))
+	left := statusStyle.Render(truncate(m.lastStatus, max(10, m.width-35)))
+	right := hintStyle.Render("f filter  F clear  a add  n notes  space done  x delete  ? manual  q quit")
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))), right)
+}
+
+func (m model) renderOverlay() string {
+	bg := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#6D8BA7")).
+		Padding(1, 2).
+		Width(min(90, max(54, m.width-10)))
+
+	switch m.overlay {
+	case overlayMember:
+		var lines []string
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Team Member"))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab/j/k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, "")
+		labels := []string{"Name", "Role", "Email"}
+		for i, in := range m.memberInputs {
+			label := labels[i]
+			if i == m.formCursor {
+				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
+			}
+			lines = append(lines, label)
+			lines = append(lines, in.View())
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	case overlayTask:
+		var lines []string
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Task"))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Members can be comma-separated; this creates one task per member."))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab/j/k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, "")
+		labels := []string{"Title", "Members", "Category", "Priority", "Tags", "Due Date", "Comments"}
+		for i, in := range m.taskInputs {
+			label := labels[i]
+			if i == m.formCursor {
+				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
+			}
+			lines = append(lines, label)
+			lines = append(lines, in.View())
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	case overlayNote:
+		lines := []string{
+			lipgloss.NewStyle().Bold(true).Render("Quick Note Capture"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Write fast notes, reuse defaults, and save with ctrl+s. esc cancels."),
+			"",
+			m.noteInput.View(),
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	case overlayFilter:
+		var lines []string
+		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Filters"))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Filter by text, member, or due date. ctrl+s applies, ctrl+r clears, esc cancels."))
+		lines = append(lines, "")
+		labels := []string{"Text", "Member", "Due Date"}
+		for i, in := range m.filterInputs {
+			label := labels[i]
+			if i == m.formCursor {
+				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
+			}
+			lines = append(lines, label)
+			lines = append(lines, in.View())
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	default:
+		return ""
+	}
+}
+
+func (m model) rowsForView() []row {
+	switch m.activeView {
+	case viewTasks:
+		tasks := m.filteredTasks()
+		rows := make([]row, 0, len(tasks))
+		for _, t := range tasks {
+			memberName := m.memberName(t.MemberID)
+			rows = append(rows, row{
+				ID:       t.ID,
+				Title:    fmt.Sprintf("%s  %s  %s", statusChip(t.Status), truncate(t.Title, 26), priorityChip(t.Priority)),
+				Subtitle: fmt.Sprintf("%s  •  %s  •  %s", fallback(memberName, "Unassigned"), fallback(t.Category, "no category"), dueLabel(t.DueDate)),
+			})
+		}
+		return rows
+	case viewMembers:
+		members := m.filteredMembers()
+		sort.Slice(members, func(i, j int) bool {
+			return strings.ToLower(members[i].Name) < strings.ToLower(members[j].Name)
+		})
+		rows := make([]row, 0, len(members))
+		for _, member := range members {
+			open, done := m.filteredMemberTaskCounts(member.ID)
+			rows = append(rows, row{
+				ID:       member.ID,
+				Title:    fmt.Sprintf("%s  %s", memberBadge(member.Name), member.Name),
+				Subtitle: fmt.Sprintf("%s  •  open %d  •  done %d", fallback(member.Role, "no role"), open, done),
+			})
+		}
+		return rows
+	case viewDates:
+		dates := m.groupedDates()
+		rows := make([]row, 0, len(dates))
+		for _, g := range dates {
+			rows = append(rows, row{
+				ID:       g.Date,
+				Title:    fmt.Sprintf("%s  (%d task%s)", dueLabel(g.Date), len(g.Tasks), plural(len(g.Tasks))),
+				Subtitle: gSummary(g.Tasks, m),
+			})
+		}
+		return rows
+	case viewHelp:
+		return []row{
+			{ID: "manual", Title: "Keyboard, mouse, quick capture, data model", Subtitle: "The full help text is on the right."},
+		}
+	default:
+		return nil
+	}
+}
+
+func (m *model) clampCursor(count int) {
+	if count <= 0 {
+		m.cursor[m.activeView] = 0
+		return
+	}
+	if m.cursor[m.activeView] < 0 {
+		m.cursor[m.activeView] = 0
+	}
+	if m.cursor[m.activeView] >= count {
+		m.cursor[m.activeView] = count - 1
+	}
+}
+
+func (m model) moveCursor(delta int) model {
+	rows := m.rowsForView()
+	if len(rows) == 0 {
+		return m
+	}
+	m.cursor[m.activeView] += delta
+	m.clampCursor(len(rows))
+	return m
+}
+
+func (m *model) nextView() {
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	idx := slices.Index(views, m.activeView)
+	m.activeView = views[(idx+1)%len(views)]
+}
+
+func (m *model) prevView() {
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	idx := slices.Index(views, m.activeView)
+	if idx <= 0 {
+		m.activeView = views[len(views)-1]
+		return
+	}
+	m.activeView = views[idx-1]
+}
+
+func (m *model) setStatus(s string) {
+	m.lastStatus = s
+	m.statusAt = time.Now()
+}
+
+func (m *model) closeOverlay(status string) {
+	m.overlay = overlayNone
+	m.formCursor = 0
+	for i := range m.memberInputs {
+		m.memberInputs[i].Blur()
+	}
+	for i := range m.taskInputs {
+		m.taskInputs[i].Blur()
+	}
+	for i := range m.filterInputs {
+		m.filterInputs[i].Blur()
+	}
+	m.noteInput.Blur()
+	if status != "" {
+		m.setStatus(status)
+	}
+}
+
+func (m *model) openMemberForm() {
+	m.overlay = overlayMember
+	m.formCursor = 0
+	for i := range m.memberInputs {
+		m.memberInputs[i].SetValue("")
+		m.memberInputs[i].Blur()
+	}
+	m.memberInputs[0].Focus()
+}
+
+func (m *model) openTaskForm(defaultMembers string) {
+	m.overlay = overlayTask
+	m.formCursor = 0
+	for i := range m.taskInputs {
+		m.taskInputs[i].SetValue("")
+		m.taskInputs[i].Blur()
+	}
+	if defaultMembers != "" {
+		m.taskInputs[1].SetValue(defaultMembers)
+	}
+	m.taskInputs[0].Focus()
+}
+
+func (m *model) openNoteForm() {
+	m.overlay = overlayNote
+	m.formCursor = 0
+	m.noteInput.SetValue("")
+	m.noteInput.Focus()
+}
+
+func (m *model) openFilterForm() {
+	m.overlay = overlayFilter
+	m.formCursor = 0
+	values := []string{m.filter.Text, m.filter.Member, m.filter.Due}
+	for i := range m.filterInputs {
+		m.filterInputs[i].SetValue(values[i])
+		m.filterInputs[i].Blur()
+	}
+	m.filterInputs[0].Focus()
+}
+
+func (m *model) navigateForm(total int, direction string) {
+	if total == 0 {
+		return
+	}
+	if m.overlay == overlayMember {
+		for i := range m.memberInputs {
+			m.memberInputs[i].Blur()
+		}
+	}
+	if m.overlay == overlayTask {
+		for i := range m.taskInputs {
+			m.taskInputs[i].Blur()
+		}
+	}
+	if m.overlay == overlayFilter {
+		for i := range m.filterInputs {
+			m.filterInputs[i].Blur()
+		}
+	}
+
+	switch direction {
+	case "tab", "down", "j":
+		m.formCursor = (m.formCursor + 1) % total
+	case "shift+tab", "up", "k":
+		m.formCursor--
+		if m.formCursor < 0 {
+			m.formCursor = total - 1
+		}
+	}
+
+	if m.overlay == overlayMember {
+		m.memberInputs[m.formCursor].Focus()
+	}
+	if m.overlay == overlayTask {
+		m.taskInputs[m.formCursor].Focus()
+	}
+	if m.overlay == overlayFilter {
+		m.filterInputs[m.formCursor].Focus()
+	}
+}
+
+func (m *model) submitMemberForm() error {
+	name := strings.TrimSpace(m.memberInputs[0].Value())
+	role := strings.TrimSpace(m.memberInputs[1].Value())
+	email := strings.TrimSpace(m.memberInputs[2].Value())
+	if name == "" {
+		return errors.New("member name is required")
+	}
+	if m.findMemberByName(name) != nil {
+		return fmt.Errorf("member %q already exists", name)
+	}
+	m.state.Members = append(m.state.Members, member{
+		ID:    nextID("mem", time.Now()),
+		Name:  name,
+		Role:  role,
+		Email: email,
+	})
+	return saveState(m.dataPath, m.state)
+}
+
+func (m *model) submitTaskForm() error {
+	title := strings.TrimSpace(m.taskInputs[0].Value())
+	memberNames := parseCSV(m.taskInputs[1].Value())
+	category := strings.TrimSpace(m.taskInputs[2].Value())
+	priority := normalizePriority(m.taskInputs[3].Value())
+	tags := parseCSV(m.taskInputs[4].Value())
+	dueDate := strings.TrimSpace(m.taskInputs[5].Value())
+	comments := splitComments(m.taskInputs[6].Value())
+
+	if title == "" {
+		return errors.New("task title is required")
+	}
+	if dueDate != "" {
+		if _, err := time.Parse(dateLayout, dueDate); err != nil {
+			return errors.New("due date must be YYYY-MM-DD")
+		}
+	}
+	if priority == "" {
+		priority = "medium"
+	}
+
+	memberIDs, err := m.ensureMembers(memberNames)
+	if err != nil {
+		return err
+	}
+	if len(memberIDs) == 0 {
+		memberIDs = []string{""}
+	}
+
+	for _, memberID := range memberIDs {
+		m.state.Tasks = append(m.state.Tasks, task{
+			ID:        nextID("tsk", time.Now()),
+			Title:     title,
+			MemberID:  memberID,
+			Category:  category,
+			Priority:  priority,
+			Tags:      tags,
+			Comments:  comments,
+			DueDate:   dueDate,
+			Status:    "open",
+			CreatedAt: time.Now(),
+		})
+	}
+
+	if err := saveState(m.dataPath, m.state); err != nil {
+		return err
+	}
+	m.activeView = viewTasks
+	m.cursor[viewTasks] = len(m.filteredTasks()) - 1
+	return nil
+}
+
+func (m *model) submitNoteForm() (int, error) {
+	tasks, err := parseQuickCapture(m.noteInput.Value(), m.state.Members)
+	if err != nil {
+		return 0, err
+	}
+	if len(tasks) == 0 {
+		return 0, errors.New("quick note did not produce any tasks")
+	}
+	m.state.Tasks = append(m.state.Tasks, tasks...)
+	if err := saveState(m.dataPath, m.state); err != nil {
+		return 0, err
+	}
+	m.activeView = viewTasks
+	m.cursor[viewTasks] = len(m.filteredTasks()) - 1
+	return len(tasks), nil
+}
+
+func (m *model) submitFilterForm() error {
+	due := strings.TrimSpace(m.filterInputs[2].Value())
+	if due != "" {
+		if _, err := time.Parse(dateLayout, due); err != nil {
+			return errors.New("filter due date must be YYYY-MM-DD")
+		}
+	}
+	m.filter = filterState{
+		Text:   strings.TrimSpace(m.filterInputs[0].Value()),
+		Member: strings.TrimSpace(m.filterInputs[1].Value()),
+		Due:    due,
+	}
+	for _, view := range []viewMode{viewTasks, viewMembers, viewDates} {
+		m.cursor[view] = 0
+	}
+	return nil
+}
+
+func (m *model) clearFilters() {
+	m.filter = filterState{}
+	for i := range m.filterInputs {
+		m.filterInputs[i].SetValue("")
+	}
+	m.setStatus("Filters cleared.")
+}
+
+func (m model) toggleSelectedTask() model {
+	selected := m.selectedTask()
+	if selected == nil {
+		m.setStatus("No task selected.")
+		return m
+	}
+	for i := range m.state.Tasks {
+		if m.state.Tasks[i].ID != selected.ID {
+			continue
+		}
+		if m.state.Tasks[i].Status == "done" {
+			m.state.Tasks[i].Status = "open"
+			m.setStatus("Task reopened.")
+		} else {
+			m.state.Tasks[i].Status = "done"
+			m.setStatus("Task completed.")
+		}
+		break
+	}
+	if err := saveState(m.dataPath, m.state); err != nil {
+		m.setStatus("save failed: " + err.Error())
+	}
+	return m
+}
+
+func (m model) deleteSelected() model {
+	switch m.activeView {
+	case viewTasks:
+		selected := m.selectedTask()
+		if selected == nil {
+			m.setStatus("No task selected.")
+			return m
+		}
+		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
+		if err := saveState(m.dataPath, m.state); err != nil {
+			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		m.setStatus("Task deleted.")
+	case viewMembers:
+		selected := m.selectedMember()
+		if selected == nil {
+			m.setStatus("No member selected.")
+			return m
+		}
+		open, done := m.memberTaskCounts(selected.ID)
+		if open+done > 0 {
+			m.setStatus("Delete member blocked: remove or reassign their tasks first.")
+			return m
+		}
+		m.state.Members = slices.DeleteFunc(m.state.Members, func(mem member) bool { return mem.ID == selected.ID })
+		if err := saveState(m.dataPath, m.state); err != nil {
+			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		m.setStatus("Member deleted.")
+	case viewDates:
+		m.setStatus("Date view is grouped. Delete tasks from Task View.")
+	default:
+		m.setStatus("Nothing to delete here.")
+	}
+	return m
+}
+
+func (m model) selectedTask() *task {
+	if m.activeView != viewTasks {
+		return nil
+	}
+	tasks := m.filteredTasks()
+	if len(tasks) == 0 {
+		return nil
+	}
+	idx := min(max(m.cursor[viewTasks], 0), len(tasks)-1)
+	return &tasks[idx]
+}
+
+func (m model) selectedMember() *member {
+	if m.activeView != viewMembers {
+		return nil
+	}
+	members := m.filteredMembers()
+	sort.Slice(members, func(i, j int) bool {
+		return strings.ToLower(members[i].Name) < strings.ToLower(members[j].Name)
+	})
+	if len(members) == 0 {
+		return nil
+	}
+	idx := min(max(m.cursor[viewMembers], 0), len(members)-1)
+	return &members[idx]
+}
+
+func (m model) selectedDateGroup() *dateGroup {
+	if m.activeView != viewDates {
+		return nil
+	}
+	groups := m.groupedDates()
+	if len(groups) == 0 {
+		return nil
+	}
+	idx := min(max(m.cursor[viewDates], 0), len(groups)-1)
+	return &groups[idx]
+}
+
+func (m model) taskDetail() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+
+	selected := m.selectedTask()
+	if selected == nil {
+		return title.Render("Task Details") + "\n" + muted.Render("Create a task with t or quick capture with n.")
+	}
+
+	memberName := fallback(m.memberName(selected.MemberID), "Unassigned")
+	tagLine := "none"
+	if len(selected.Tags) > 0 {
+		tagLine = strings.Join(selected.Tags, ", ")
+	}
+	commentLine := "none"
+	if len(selected.Comments) > 0 {
+		commentLine = strings.Join(selected.Comments, "\n- ")
+		commentLine = "- " + commentLine
+	}
+
+	lines := []string{
+		title.Render(selected.Title),
+		"",
+		fmt.Sprintf("Status    %s", statusChip(selected.Status)),
+		fmt.Sprintf("Member    %s", memberBadge(memberName)),
+		fmt.Sprintf("Category  %s", fallback(selected.Category, "none")),
+		fmt.Sprintf("Priority  %s", priorityChip(selected.Priority)),
+		fmt.Sprintf("Due       %s", dueLabel(selected.DueDate)),
+		fmt.Sprintf("Tags      %s", tagLine),
+		"",
+		"Comments",
+		commentLine,
+		"",
+		muted.Render(fmt.Sprintf("Created %s", selected.CreatedAt.Format("2006-01-02 15:04"))),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) memberDetail() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+
+	selected := m.selectedMember()
+	if selected == nil {
+		return title.Render("Member Details") + "\n" + muted.Render("Add a member with m.")
+	}
+
+	tasks := m.tasksForMember(selected.ID)
+	lines := []string{
+		title.Render(selected.Name),
+		"",
+		fmt.Sprintf("Role     %s", fallback(selected.Role, "none")),
+		fmt.Sprintf("Contact  %s", fallback(selected.Email, "none")),
+		fmt.Sprintf("Badge    %s", memberBadge(selected.Name)),
+		"",
+		"Tasks",
+	}
+	if len(tasks) == 0 {
+		lines = append(lines, muted.Render("No tasks assigned yet."))
+		return strings.Join(lines, "\n")
+	}
+	for _, t := range tasks {
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("%s %s", statusChip(t.Status), t.Title))
+		lines = append(lines, fmt.Sprintf("  %s  •  %s  •  %s", fallback(t.Category, "no category"), priorityChip(t.Priority), dueLabel(t.DueDate)))
+		if len(t.Tags) > 0 {
+			lines = append(lines, "  tags: "+strings.Join(t.Tags, ", "))
+		}
+		if len(t.Comments) > 0 {
+			lines = append(lines, "  notes: "+strings.Join(t.Comments, " | "))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) dateDetail() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
+
+	selected := m.selectedDateGroup()
+	if selected == nil {
+		return title.Render("Due Date Details") + "\n" + muted.Render("No due dates yet. Add tasks with a due date.")
+	}
+
+	lines := []string{
+		title.Render(dueLabel(selected.Date)),
+		"",
+		fmt.Sprintf("%d task%s due", len(selected.Tasks), plural(len(selected.Tasks))),
+		"",
+	}
+	for _, t := range selected.Tasks {
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("%s %s", statusChip(t.Status), t.Title))
+		lines = append(lines, fmt.Sprintf("  %s  •  %s  •  %s", memberBadge(fallback(m.memberName(t.MemberID), "Unassigned")), fallback(t.Category, "no category"), priorityChip(t.Priority)))
+		if len(t.Tags) > 0 {
+			lines = append(lines, "  tags: "+strings.Join(t.Tags, ", "))
+		}
+		if len(t.Comments) > 0 {
+			lines = append(lines, "  notes: "+strings.Join(t.Comments, " | "))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) listHint() string {
+	switch m.activeView {
+	case viewTasks:
+		return "j/k move • space mark done • t add task • n quick notes • f filter"
+	case viewMembers:
+		return "j/k move • m add member • t add task for selected member • f filter"
+	case viewDates:
+		return "j/k move • grouped by due date • full tasks on right • f filter"
+	case viewHelp:
+		return "Full manual on the right pane"
+	default:
+		return ""
+	}
+}
+
+func (m model) resizeEditors() {
+	width := min(80, max(42, m.width-16))
+	height := min(18, max(10, m.height-10))
+	m.noteInput.SetWidth(width)
+	m.noteInput.SetHeight(height)
+	for i := range m.memberInputs {
+		m.memberInputs[i].Width = width - 4
+	}
+	for i := range m.taskInputs {
+		m.taskInputs[i].Width = width - 4
+	}
+	for i := range m.filterInputs {
+		m.filterInputs[i].Width = width - 4
+	}
+}
+
+func (m model) prefillMemberNames() string {
+	if m.activeView != viewMembers {
+		return ""
+	}
+	selected := m.selectedMember()
+	if selected == nil {
+		return ""
+	}
+	return selected.Name
+}
+
+func (m model) tasksForMember(memberID string) []task {
+	var out []task
+	for _, t := range m.filteredTasks() {
+		if t.MemberID == memberID {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (m model) memberTaskCounts(memberID string) (open int, done int) {
+	for _, t := range m.state.Tasks {
+		if t.MemberID != memberID {
+			continue
+		}
+		if t.Status == "done" {
+			done++
+		} else {
+			open++
+		}
+	}
+	return open, done
+}
+
+func (m model) filteredMemberTaskCounts(memberID string) (open int, done int) {
+	for _, t := range m.filteredTasks() {
+		if t.MemberID != memberID {
+			continue
+		}
+		if t.Status == "done" {
+			done++
+		} else {
+			open++
+		}
+	}
+	return open, done
+}
+
+func (m model) sortedTasks() []task {
+	tasks := slices.Clone(m.state.Tasks)
+	sort.Slice(tasks, func(i, j int) bool {
+		left, right := tasks[i], tasks[j]
+		if left.Status != right.Status {
+			return left.Status < right.Status
+		}
+		ld := sortableDue(left.DueDate)
+		rd := sortableDue(right.DueDate)
+		if !ld.Equal(rd) {
+			return ld.Before(rd)
+		}
+		lp := priorityRank(left.Priority)
+		rp := priorityRank(right.Priority)
+		if lp != rp {
+			return lp > rp
+		}
+		return strings.ToLower(left.Title) < strings.ToLower(right.Title)
+	})
+	return tasks
+}
+
+type dateGroup struct {
+	Date  string
+	Tasks []task
+}
+
+func (m model) groupedDates() []dateGroup {
+	groupMap := map[string][]task{}
+	for _, t := range m.filteredTasks() {
+		if strings.TrimSpace(t.DueDate) == "" {
+			continue
+		}
+		groupMap[t.DueDate] = append(groupMap[t.DueDate], t)
+	}
+	var groups []dateGroup
+	for date, tasks := range groupMap {
+		groups = append(groups, dateGroup{Date: date, Tasks: tasks})
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return sortableDue(groups[i].Date).Before(sortableDue(groups[j].Date))
+	})
+	return groups
+}
+
+func (m model) filteredTasks() []task {
+	tasks := m.sortedTasks()
+	if m.filter == (filterState{}) {
+		return tasks
+	}
+	return slices.DeleteFunc(tasks, func(t task) bool {
+		return !m.matchesTaskFilters(t)
+	})
+}
+
+func (m model) filteredMembers() []member {
+	if m.filter == (filterState{}) {
+		return slices.Clone(m.state.Members)
+	}
+	var out []member
+	for _, mem := range m.state.Members {
+		if m.filter.Member != "" && !strings.Contains(strings.ToLower(mem.Name), strings.ToLower(m.filter.Member)) {
+			continue
+		}
+		if m.filter.Text != "" {
+			hay := strings.ToLower(strings.Join([]string{mem.Name, mem.Role, mem.Email}, " "))
+			if strings.Contains(hay, strings.ToLower(m.filter.Text)) {
+				out = append(out, mem)
+				continue
+			}
+		}
+		if len(m.tasksForMember(mem.ID)) > 0 {
+			out = append(out, mem)
+		}
+	}
+	return out
+}
+
+func (m model) matchesTaskFilters(t task) bool {
+	if m.filter.Member != "" {
+		memberName := strings.ToLower(m.memberName(t.MemberID))
+		if !strings.Contains(memberName, strings.ToLower(m.filter.Member)) {
+			return false
+		}
+	}
+	if m.filter.Due != "" && strings.TrimSpace(t.DueDate) != m.filter.Due {
+		return false
+	}
+	if m.filter.Text != "" {
+		hay := []string{
+			t.Title,
+			t.Category,
+			t.Priority,
+			t.DueDate,
+			m.memberName(t.MemberID),
+			strings.Join(t.Tags, " "),
+			strings.Join(t.Comments, " "),
+		}
+		if !strings.Contains(strings.ToLower(strings.Join(hay, " ")), strings.ToLower(m.filter.Text)) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m model) filterSummary() string {
+	parts := []string{}
+	if m.filter.Text != "" {
+		parts = append(parts, "text="+m.filter.Text)
+	}
+	if m.filter.Member != "" {
+		parts = append(parts, "member="+m.filter.Member)
+	}
+	if m.filter.Due != "" {
+		parts = append(parts, "due="+m.filter.Due)
+	}
+	if len(parts) == 0 {
+		return "No filters active."
+	}
+	return "Filters active: " + strings.Join(parts, ", ")
+}
+
+func (m model) memberName(memberID string) string {
+	for _, mem := range m.state.Members {
+		if mem.ID == memberID {
+			return mem.Name
+		}
+	}
+	return ""
+}
+
+func (m model) ensureMembers(names []string) ([]string, error) {
+	var ids []string
+	for _, name := range names {
+		existing := m.findMemberByName(name)
+		if existing == nil {
+			return nil, fmt.Errorf("member %q does not exist; add them first", name)
+		}
+		ids = append(ids, existing.ID)
+	}
+	return ids, nil
+}
+
+func (m model) findMemberByName(name string) *member {
+	name = strings.TrimSpace(strings.ToLower(name))
+	for _, mem := range m.state.Members {
+		if strings.ToLower(mem.Name) == name {
+			copy := mem
+			return &copy
+		}
+	}
+	return nil
+}
+
+func loadState(path string) (appState, error) {
+	var state appState
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return appState{}, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	if len(data) == 0 {
+		return state, nil
+	}
+	err = json.Unmarshal(data, &state)
+	return state, err
+}
+
+func saveState(path string, state appState) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func parseQuickCapture(input string, members []member) ([]task, error) {
+	type defaults struct {
+		memberIDs []string
+		category  string
+		priority  string
+		tags      []string
+		dueDate   string
+	}
+
+	memberIndex := make(map[string]string, len(members))
+	for _, mem := range members {
+		memberIndex[strings.ToLower(mem.Name)] = mem.ID
+	}
+
+	var out []task
+	ctx := defaults{priority: "medium"}
+
+	lines := strings.Split(input, "\n")
+	for idx, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "//") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "@") && !strings.HasPrefix(line, "-") {
+			names := parseCSV(strings.TrimPrefix(line, "@"))
+			ids, err := resolveMembers(names, memberIndex)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %w", idx+1, err)
+			}
+			ctx.memberIDs = ids
+			continue
+		}
+		if strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "-") {
+			ctx.category = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+			continue
+		}
+		if strings.HasPrefix(line, "!") && !strings.HasPrefix(line, "-") {
+			ctx.priority = normalizePriority(strings.TrimPrefix(line, "!"))
+			if ctx.priority == "" {
+				ctx.priority = "medium"
+			}
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(line), "due:") && !strings.HasPrefix(line, "-") {
+			due := strings.TrimSpace(line[4:])
+			if due != "" {
+				if _, err := time.Parse(dateLayout, due); err != nil {
+					return nil, fmt.Errorf("line %d: due date must be YYYY-MM-DD", idx+1)
+				}
+			}
+			ctx.dueDate = due
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(line), "tags:") && !strings.HasPrefix(line, "-") {
+			ctx.tags = parseCSV(line[5:])
+			continue
+		}
+
+		if strings.HasPrefix(line, "-") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "-"))
+		}
+
+		comment := ""
+		if before, after, ok := strings.Cut(line, "//"); ok {
+			line = strings.TrimSpace(before)
+			comment = strings.TrimSpace(after)
+		}
+
+		meta := ctx
+		words := strings.Fields(line)
+		titleParts := make([]string, 0, len(words))
+		for _, word := range words {
+			switch {
+			case strings.HasPrefix(word, "@"):
+				names := parseCSV(strings.TrimPrefix(word, "@"))
+				ids, err := resolveMembers(names, memberIndex)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: %w", idx+1, err)
+				}
+				meta.memberIDs = ids
+			case strings.HasPrefix(word, "#"):
+				meta.category = strings.TrimPrefix(word, "#")
+			case strings.HasPrefix(word, "!"):
+				meta.priority = normalizePriority(strings.TrimPrefix(word, "!"))
+			case strings.HasPrefix(strings.ToLower(word), "due:"):
+				date := strings.TrimSpace(word[4:])
+				if date != "" {
+					if _, err := time.Parse(dateLayout, date); err != nil {
+						return nil, fmt.Errorf("line %d: due date must be YYYY-MM-DD", idx+1)
+					}
+				}
+				meta.dueDate = date
+			case strings.HasPrefix(strings.ToLower(word), "tags:"):
+				meta.tags = parseCSV(word[5:])
+			default:
+				titleParts = append(titleParts, word)
+			}
+		}
+
+		title := strings.TrimSpace(strings.Join(titleParts, " "))
+		if title == "" {
+			return nil, fmt.Errorf("line %d: task title is empty", idx+1)
+		}
+		if meta.priority == "" {
+			meta.priority = "medium"
+		}
+		memberIDs := meta.memberIDs
+		if len(memberIDs) == 0 {
+			memberIDs = []string{""}
+		}
+		for _, memberID := range memberIDs {
+			newTask := task{
+				ID:        nextID("tsk", time.Now()),
+				Title:     title,
+				MemberID:  memberID,
+				Category:  meta.category,
+				Priority:  meta.priority,
+				Tags:      slices.Clone(meta.tags),
+				DueDate:   meta.dueDate,
+				Status:    "open",
+				CreatedAt: time.Now(),
+			}
+			if comment != "" {
+				newTask.Comments = []string{comment}
+			}
+			out = append(out, newTask)
+		}
+	}
+
+	return out, nil
+}
+
+func resolveMembers(names []string, memberIndex map[string]string) ([]string, error) {
+	var ids []string
+	for _, name := range names {
+		id, ok := memberIndex[strings.ToLower(strings.TrimSpace(name))]
+		if !ok {
+			return nil, fmt.Errorf("member %q does not exist", name)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func notePlaceholder() string {
+	return strings.TrimSpace(`
+@Ali
+#backend
+!high
+due:2026-03-20
+tags:api,release
+
+- Fix token refresh flow // check mobile fallback
+- Review deploy checklist @Ali,Sara #ops !urgent due:2026-03-18
+`)
+}
+
+func helpManual() string {
+	return strings.Join([]string{
+		"Manual",
+		"",
+		"Views",
+		"1 / 2 / 3 / 4 jump between Tasks, Members, Due Dates, and Help.",
+		"tab / shift+tab or h/l also switch views.",
+		"",
+		"Navigation",
+		"j / k or arrows move through the active list.",
+		"gg jumps to the first row. G jumps to the last row.",
+		"Mouse wheel scrolls. Left click selects a tab or row.",
+		"",
+		"Actions",
+		"m opens the member form.",
+		"t opens the task form. From Member View it prefills the selected member.",
+		"a is context-aware: add member in Member View, add task elsewhere.",
+		"f or / opens filters. F clears all filters.",
+		"space toggles a task between open and done in Task View.",
+		"x deletes the selected task, or deletes a member with no remaining tasks.",
+		"n opens quick note capture.",
+		"? opens this help pane. q quits.",
+		"",
+		"Quick Note Capture",
+		"Use plain note lines and lightweight tokens.",
+		"Standalone defaults:",
+		"@Ali,Sara sets default assignees for following tasks.",
+		"#backend sets default category.",
+		"!high sets default priority.",
+		"due:2026-03-20 sets default due date.",
+		"tags:api,release sets default tags.",
+		"",
+		"Task lines",
+		"Start with '-' for readability, then write the task title.",
+		"Inline tokens override defaults on that line only.",
+		"// starts a comment captured into the task comments.",
+		"",
+		"Examples",
+		"- Fix login bug @Ali #backend !urgent due:2026-03-18 tags:bug,auth // verify on iOS",
+		"- Draft sprint notes @Sara",
+		"",
+		"Data",
+		"Everything is stored locally in promag-data.json in this project directory.",
+		"Due dates use YYYY-MM-DD.",
+		"Task form supports comma-separated members and will create one task per member.",
+		"Mouse: click tabs or list rows, wheel to scroll.",
+	}, "\n")
+}
+
+func dueLabel(date string) string {
+	if strings.TrimSpace(date) == "" {
+		return "No due date"
+	}
+	t, err := time.Parse(dateLayout, date)
+	if err != nil {
+		return date
+	}
+	now := time.Now()
+	diff := int(t.Sub(time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())).Hours() / 24)
+	switch {
+	case diff == 0:
+		return fmt.Sprintf("%s  (today)", date)
+	case diff == 1:
+		return fmt.Sprintf("%s  (tomorrow)", date)
+	case diff == -1:
+		return fmt.Sprintf("%s  (yesterday)", date)
+	case diff > 1:
+		return fmt.Sprintf("%s  (%dd)", date, diff)
+	default:
+		return fmt.Sprintf("%s  (%dd overdue)", date, -diff)
+	}
+}
+
+func sortableDue(date string) time.Time {
+	if strings.TrimSpace(date) == "" {
+		return time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	t, err := time.Parse(dateLayout, date)
+	if err != nil {
+		return time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return t
+}
+
+func priorityRank(priority string) int {
+	switch normalizePriority(priority) {
+	case "urgent":
+		return 4
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func normalizePriority(priority string) string {
+	p := strings.TrimSpace(strings.ToLower(priority))
+	switch p {
+	case "low", "medium", "high", "urgent":
+		return p
+	case "med":
+		return "medium"
+	case "crit", "critical":
+		return "urgent"
+	default:
+		return p
+	}
+}
+
+func splitComments(value string) []string {
+	parts := strings.Split(value, "|")
+	var comments []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			comments = append(comments, part)
+		}
+	}
+	return comments
+}
+
+func parseCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	var out []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func nextID(prefix string, now time.Time) string {
+	return fmt.Sprintf("%s_%d", prefix, now.UnixNano())
+}
+
+func statusChip(status string) string {
+	style := lipgloss.NewStyle().Bold(true)
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done":
+		return style.Foreground(lipgloss.Color("#7CC5A1")).Render("done")
+	default:
+		return style.Foreground(lipgloss.Color("#E7B16A")).Render("open")
+	}
+}
+
+func priorityChip(priority string) string {
+	style := lipgloss.NewStyle().Bold(true)
+	switch normalizePriority(priority) {
+	case "urgent":
+		return style.Foreground(lipgloss.Color("#F28B82")).Render("urgent")
+	case "high":
+		return style.Foreground(lipgloss.Color("#F6C177")).Render("high")
+	case "medium":
+		return style.Foreground(lipgloss.Color("#8FB8DE")).Render("medium")
+	case "low":
+		return style.Foreground(lipgloss.Color("#7CC5A1")).Render("low")
+	default:
+		return style.Foreground(lipgloss.Color("#AEB7C4")).Render(fallback(priority, "none"))
+	}
+}
+
+func memberBadge(name string) string {
+	style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(memberColor(name)))
+	initials := initials(name)
+	if initials == "" {
+		initials = "?"
+	}
+	return style.Render(initials)
+}
+
+func memberColor(name string) string {
+	palette := []string{"#A7C7E7", "#B8D8BA", "#D8C3A5", "#E7B7A3", "#B6C7E5", "#D4B6D9"}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(name)))
+	return palette[int(h.Sum32())%len(palette)]
+}
+
+func initials(name string) string {
+	parts := strings.Fields(name)
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		r := []rune(parts[0])
+		return strings.ToUpper(string(r[:min(2, len(r))]))
+	}
+	return strings.ToUpper(string([]rune(parts[0])[0]) + string([]rune(parts[1])[0]))
+}
+
+func fallback(value, alt string) string {
+	if strings.TrimSpace(value) == "" {
+		return alt
+	}
+	return value
+}
+
+func truncate(value string, width int) string {
+	if lipgloss.Width(value) <= width {
+		return value
+	}
+	if width <= 1 {
+		return value[:width]
+	}
+	runes := []rune(value)
+	if len(runes) > width-1 {
+		return string(runes[:width-1]) + "…"
+	}
+	return value
+}
+
+func gSummary(tasks []task, m model) string {
+	var parts []string
+	for i, t := range tasks {
+		if i == 3 {
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s", fallback(m.memberName(t.MemberID), "unassigned"), truncate(t.Title, 16)))
+	}
+	return strings.Join(parts, "  •  ")
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+func inZone(x, y int, z zone) bool {
+	return x >= z.X1 && x <= z.X2 && y >= z.Y1 && y <= z.Y2
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
