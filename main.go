@@ -2038,26 +2038,8 @@ func helpManual() string {
 	return strings.Join([]string{
 		"Manual",
 		"",
-		"Views",
-		"1 / 2 / 3 / 4 jump between Tasks, Members, Due Dates, and Help.",
-		"tab / shift+tab or h/l also switch views.",
-		"",
-		"Navigation",
-		"j / k or arrows move through the active list.",
-		"gg jumps to the first row. G jumps to the last row.",
-		"Mouse wheel scrolls. Left click selects a tab or row.",
-		"",
-		"Actions",
-		"m opens the member form.",
-		"t opens the task form. From Member View it prefills the selected member.",
-		"a is context-aware: add member in Member View, add task elsewhere.",
-		"f or / opens filters. F clears all filters.",
-		"tab accepts an autocomplete suggestion in member fields, otherwise it moves forward.",
-		"up/down arrows and ctrl+j / ctrl+k move between fields while editing forms.",
-		"space toggles a task between open and done in Task View.",
-		"x deletes the selected task, or deletes a member with no remaining tasks.",
-		"n opens batch note capture with default member and due-date scope fields.",
-		"? opens this help pane. q quits.",
+		"Keybinds",
+		manualKeybindTable(),
 		"",
 		"Quick Note Capture",
 		"Use the top fields to scope the batch, then write plain task lines below.",
@@ -2086,6 +2068,55 @@ func helpManual() string {
 		"Task form supports comma-separated members and will create one task per member.",
 		"Mouse: click tabs or list rows, wheel to scroll.",
 	}, "\n")
+}
+
+func manualKeybindTable() string {
+	rows := [][2]string{
+		{"1 / 2 / 3 / 4", "Jump to Tasks, Team, Timeline, Help"},
+		{"tab / shift+tab", "Cycle views"},
+		{"h / l", "Previous / next view"},
+		{"j / k, arrows", "Move through the active list"},
+		{"gg / G", "First / last row"},
+		{"mouse wheel", "Scroll the active pane"},
+		{"left click", "Select a tab or row"},
+		{"m", "Open member form"},
+		{"t", "Open task form"},
+		{"a", "Context-aware add action"},
+		{"f or /", "Open filters"},
+		{"F", "Clear all filters"},
+		{"tab", "Accept autocomplete or move forward in forms"},
+		{"up/down, ctrl+j/k", "Move between form fields"},
+		{"space", "Toggle done in Task View"},
+		{"x", "Delete selected task or empty member"},
+		{"n", "Open batch note capture"},
+		{"?", "Open this help pane"},
+		{"q", "Quit"},
+	}
+
+	keyWidth := len("Keys")
+	actionWidth := len("Action")
+	for _, row := range rows {
+		if len(row[0]) > keyWidth {
+			keyWidth = len(row[0])
+		}
+		if len(row[1]) > actionWidth {
+			actionWidth = len(row[1])
+		}
+	}
+
+	top := "┌" + strings.Repeat("─", keyWidth+2) + "┬" + strings.Repeat("─", actionWidth+2) + "┐"
+	sep := "├" + strings.Repeat("─", keyWidth+2) + "┼" + strings.Repeat("─", actionWidth+2) + "┤"
+	bottom := "└" + strings.Repeat("─", keyWidth+2) + "┴" + strings.Repeat("─", actionWidth+2) + "┘"
+	lines := []string{
+		top,
+		fmt.Sprintf("│ %-*s │ %-*s │", keyWidth, "Keys", actionWidth, "Action"),
+		sep,
+	}
+	for _, row := range rows {
+		lines = append(lines, fmt.Sprintf("│ %-*s │ %-*s │", keyWidth, row[0], actionWidth, row[1]))
+	}
+	lines = append(lines, bottom)
+	return strings.Join(lines, "\n")
 }
 
 func (m model) renderMetric(label, value string, accent lipgloss.Color) string {
