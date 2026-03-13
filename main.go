@@ -27,6 +27,8 @@ const (
 )
 
 var naturalDateParser = when.EN
+var ui = newTheme()
+var debugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_LOG"))
 
 type viewMode string
 
@@ -99,8 +101,12 @@ type model struct {
 	lastStatus string
 	statusAt   time.Time
 
-	tabZones []zone
-	rowZones []zone
+	tabZones     []zone
+	rowZones     []zone
+	leftZone     zone
+	rightZone    zone
+	bodyHeight   int
+	detailHeight int
 
 	overlay overlayMode
 
@@ -111,14 +117,117 @@ type model struct {
 	noteInput    textarea.Model
 	formCursor   int
 
-	pendingG bool
-	filter   filterState
+	pendingG     bool
+	filter       filterState
+	detailScroll map[viewMode]int
 }
 
 type filterState struct {
 	Text   string
 	Member string
 	Due    string
+}
+
+type theme struct {
+	bg              lipgloss.Color
+	panel           lipgloss.Color
+	panelAlt        lipgloss.Color
+	border          lipgloss.Color
+	borderStrong    lipgloss.Color
+	text            lipgloss.Color
+	muted           lipgloss.Color
+	subtle          lipgloss.Color
+	accent          lipgloss.Color
+	accentSoft      lipgloss.Color
+	accentContrast  lipgloss.Color
+	success         lipgloss.Color
+	warn            lipgloss.Color
+	danger          lipgloss.Color
+	headerFrame     lipgloss.Style
+	panelFrame      lipgloss.Style
+	panelFrameAlt   lipgloss.Style
+	rowSelected     lipgloss.Style
+	rowIdle         lipgloss.Style
+	modalFrame      lipgloss.Style
+	statusFrame     lipgloss.Style
+	title           lipgloss.Style
+	subtitle        lipgloss.Style
+	eyebrow         lipgloss.Style
+	sectionTitle    lipgloss.Style
+	metricValue     lipgloss.Style
+	metricLabel     lipgloss.Style
+	tabIdle         lipgloss.Style
+	tabActive       lipgloss.Style
+	inputLabel      lipgloss.Style
+	inputLabelFocus lipgloss.Style
+	keycap          lipgloss.Style
+}
+
+func newTheme() theme {
+	return theme{
+		bg:             lipgloss.Color("#08111F"),
+		panel:          lipgloss.Color("#0E1A2B"),
+		panelAlt:       lipgloss.Color("#111F33"),
+		border:         lipgloss.Color("#20334D"),
+		borderStrong:   lipgloss.Color("#4E87B8"),
+		text:           lipgloss.Color("#ECF3FB"),
+		muted:          lipgloss.Color("#93A4B8"),
+		subtle:         lipgloss.Color("#6F8098"),
+		accent:         lipgloss.Color("#7FDBB6"),
+		accentSoft:     lipgloss.Color("#173A39"),
+		accentContrast: lipgloss.Color("#08111F"),
+		success:        lipgloss.Color("#7FDBB6"),
+		warn:           lipgloss.Color("#F6C177"),
+		danger:         lipgloss.Color("#F28B82"),
+		headerFrame: lipgloss.NewStyle().
+			Padding(1, 1, 0, 1),
+		panelFrame: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#223753")).
+			Padding(1, 2),
+		panelFrameAlt: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#28425F")).
+			Padding(1, 2),
+		rowSelected: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#F8FBFF")).
+			BorderLeft(true).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(lipgloss.Color("#7FDBB6")).
+			Padding(0, 1),
+		rowIdle: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#D9E6F3")).
+			Padding(0, 2),
+		modalFrame: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#5C8AB3")).
+			Padding(1, 2),
+		statusFrame: lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), true, false, false, false).
+			BorderForeground(lipgloss.Color("#20334D")).
+			Padding(0, 1),
+		title:        lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F5FAFF")),
+		subtitle:     lipgloss.NewStyle().Foreground(lipgloss.Color("#93A4B8")),
+		eyebrow:      lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7FDBB6")),
+		sectionTitle: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D6E4F3")),
+		metricValue:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F5FAFF")),
+		metricLabel:  lipgloss.NewStyle().Foreground(lipgloss.Color("#6F8098")),
+		tabIdle: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(lipgloss.Color("#AEBED0")),
+		tabActive: lipgloss.NewStyle().
+			Bold(true).
+			Padding(0, 1).
+			Foreground(lipgloss.Color("#7FDBB6")).
+			Underline(true),
+		inputLabel:      lipgloss.NewStyle().Foreground(lipgloss.Color("#93A4B8")),
+		inputLabelFocus: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7FDBB6")),
+		keycap: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#DCE9F6")).
+			Background(lipgloss.Color("#14263B")).
+			Padding(0, 1),
+	}
 }
 
 func main() {
@@ -129,12 +238,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(
-		newModel(path, state),
-		tea.WithAltScreen(),
+	opts := []tea.ProgramOption{
 		tea.WithMouseCellMotion(),
 		tea.WithMouseAllMotion(),
-	)
+	}
+	if os.Getenv("PROMAG_NO_ALTSCREEN") == "" {
+		opts = append(opts, tea.WithAltScreen())
+	}
+
+	p := tea.NewProgram(newModel(path, state), opts...)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run app: %v\n", err)
@@ -221,6 +333,7 @@ func newModel(path string, state appState) model {
 		noteInput:    noteInput,
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
+		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewHelp: 0},
 	}
 	model.refreshMemberSuggestions()
 	return model
@@ -252,19 +365,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress {
 		if msg.Button == tea.MouseButtonWheelUp {
-			return m.moveCursor(-1), nil
+			return m.scrollByPointer(msg.X, msg.Y, -1), nil
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
-			return m.moveCursor(1), nil
+			return m.scrollByPointer(msg.X, msg.Y, 1), nil
 		}
 		return m, nil
 	}
 
 	if msg.Button == tea.MouseButtonWheelUp {
-		return m.moveCursor(-1), nil
+		return m.scrollByPointer(msg.X, msg.Y, -1), nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
-		return m.moveCursor(1), nil
+		return m.scrollByPointer(msg.X, msg.Y, 1), nil
 	}
 	if msg.Button != tea.MouseButtonLeft || m.overlay != overlayNone {
 		return m, nil
@@ -278,9 +391,15 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	for i, z := range m.rowZones {
+	for _, z := range m.rowZones {
 		if inZone(msg.X, msg.Y, z) {
-			m.cursor[m.activeView] = i
+			rows := m.rowsForView()
+			for idx, r := range rows {
+				if r.ID == z.ID {
+					m.cursor[m.activeView] = idx
+					break
+				}
+			}
 			return m, nil
 		}
 	}
@@ -333,6 +452,18 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.moveCursor(1), nil
 	case "k", "up":
 		return m.moveCursor(-1), nil
+	case "ctrl+d", "pagedown":
+		return m.scrollDetail(8), nil
+	case "ctrl+u", "pageup":
+		return m.scrollDetail(-8), nil
+	case "d":
+		if m.activeView == viewHelp {
+			return m.scrollDetail(8), nil
+		}
+	case "u":
+		if m.activeView == viewHelp {
+			return m.scrollDetail(-8), nil
+		}
 	case "g":
 		if m.pendingG {
 			m.cursor[m.activeView] = 0
@@ -345,6 +476,14 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor[m.activeView] = max(0, len(m.rowsForView())-1)
 		m.pendingG = false
 		return m, nil
+	case "]":
+		return m.scrollDetail(1), nil
+	case "[":
+		return m.scrollDetail(-1), nil
+	case "J":
+		return m.scrollDetail(1), nil
+	case "K":
+		return m.scrollDetail(-1), nil
 	case "a":
 		if m.activeView == viewMembers {
 			m.openMemberForm()
@@ -539,17 +678,21 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	if m.width == 0 || m.height == 0 {
-		return "loading..."
+		return ui.subtitle.Render("loading...")
 	}
 
 	m.tabZones = nil
 	m.rowZones = nil
+	m.leftZone = zone{}
+	m.rightZone = zone{}
 
 	header := m.renderHeader()
 	m.bodyTop = lipgloss.Height(header)
 	status := m.renderStatus()
 	bodyHeight := max(8, m.height-lipgloss.Height(header)-lipgloss.Height(status)-1)
+	m.bodyHeight = bodyHeight
 	body := m.renderBody(bodyHeight)
+	debugLogf("view width=%d height=%d header_height=%d status_height=%d body_height=%d hide_body=%t", m.width, m.height, lipgloss.Height(header), lipgloss.Height(status), bodyHeight, hideBody())
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 	if m.overlay != overlayNone {
@@ -559,34 +702,24 @@ func (m model) View() string {
 }
 
 func (m model) renderHeader() string {
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#F2F4F8"))
-	subStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-	tabActive := lipgloss.NewStyle().
-		Bold(true).
-		Padding(0, 1).
-		Foreground(lipgloss.Color("#111827")).
-		Background(lipgloss.Color("#A7C7E7"))
-	tabIdle := lipgloss.NewStyle().
-		Padding(0, 1).
-		Foreground(lipgloss.Color("#AEB7C4")).
-		Background(lipgloss.Color("#1D2735"))
-
+	frameWidth := max(20, m.width)
+	contentWidth := max(20, frameWidth-ui.headerFrame.GetHorizontalFrameSize())
 	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
 	labels := map[viewMode]string{
 		viewTasks:   "1 Tasks",
-		viewMembers: "2 Members",
-		viewDates:   "3 Due Dates",
-		viewHelp:    "4 Help",
+		viewMembers: "2 Team",
+		viewDates:   "3 Timeline",
+		viewHelp:    "4 Guide",
 	}
 
-	tabY := 1
+	tabY := 3
 	x := 0
 	tabParts := make([]string, 0, len(views))
 	for _, v := range views {
 		label := labels[v]
-		style := tabIdle
+		style := ui.tabIdle
 		if m.activeView == v {
-			style = tabActive
+			style = ui.tabActive
 		}
 		rendered := style.Render(label)
 		w := lipgloss.Width(rendered)
@@ -595,22 +728,51 @@ func (m model) renderHeader() string {
 		tabParts = append(tabParts, rendered)
 	}
 
-	line1 := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		titleStyle.Render(appTitle),
-		"  ",
-		subStyle.Render("simple project management for teams"),
+	stats := []string{
+		m.renderMetric("Open", fmt.Sprintf("%d", m.openTaskCount()), ui.warn),
+		m.renderMetric("Done", fmt.Sprintf("%d", m.doneTaskCount()), ui.success),
+		m.renderMetric("Overdue", fmt.Sprintf("%d", m.overdueTaskCount()), ui.danger),
+		m.renderMetric("People", fmt.Sprintf("%d", len(m.state.Members)), ui.borderStrong),
+	}
+	statsLine := lipgloss.JoinHorizontal(lipgloss.Top, stats...)
+	brandLine := lipgloss.JoinHorizontal(
+		lipgloss.Center,
+		ui.title.Render(appTitle),
+		" ",
+		ui.subtitle.Render("project board"),
 	)
-	line2 := strings.Join(tabParts, " ")
-	return lipgloss.JoinVertical(lipgloss.Left, line1, line2)
+	tabsLine := strings.Join(tabParts, " ")
+	if lipgloss.Width(tabsLine) > contentWidth {
+		tabsLine = ui.subtitle.Render("1-4 switch views")
+	}
+
+	lines := []string{}
+	if lipgloss.Width(brandLine)+lipgloss.Width(statsLine)+2 <= contentWidth {
+		lines = append(lines, joinHeaderLine(brandLine, statsLine, contentWidth))
+	} else {
+		lines = append(lines, truncate(brandLine, contentWidth))
+		lines = append(lines, truncate(statsLine, contentWidth))
+		tabY = 4
+	}
+	lines = append(lines, "")
+	lines = append(lines, tabsLine)
+	content := strings.Join(lines, "\n")
+	debugLogf("header frame_width=%d content_width=%d lines=%d raw=%q", frameWidth, contentWidth, len(lines), content)
+	return ui.headerFrame.Width(frameWidth).Render(content)
 }
 
 func (m model) renderBody(bodyHeight int) string {
-	leftWidth := max(minLeftWidth, min(m.width/2-1, 48))
-	if leftWidth > m.width-32 {
-		leftWidth = max(28, m.width/2)
+	if hideBody() {
+		debugLogf("body hidden height=%d", bodyHeight)
+		return strings.Join(make([]string, bodyHeight), "\n")
 	}
-	rightWidth := max(30, m.width-leftWidth-3)
+	availableWidth := max(60, m.width)
+	gapWidth := 1
+	leftWidth := max(minLeftWidth, min(availableWidth/2-1, 48))
+	if leftWidth > availableWidth-32 {
+		leftWidth = max(28, availableWidth/2)
+	}
+	rightWidth := max(30, availableWidth-leftWidth-gapWidth)
 
 	rows := m.rowsForView()
 	m.clampCursor(len(rows))
@@ -618,41 +780,49 @@ func (m model) renderBody(bodyHeight int) string {
 
 	left := m.renderList(rows, leftWidth, bodyHeight, selected)
 	right := m.renderDetail(rightWidth, bodyHeight)
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, "   ", right)
+	totalWidth := lipgloss.Width(left) + gapWidth + lipgloss.Width(right)
+	if overflow := totalWidth - m.width; overflow > 0 {
+		rightWidth = max(30, rightWidth-overflow)
+		right = m.renderDetail(rightWidth, bodyHeight)
+		totalWidth = lipgloss.Width(left) + gapWidth + lipgloss.Width(right)
+	}
+	if overflow := totalWidth - m.width; overflow > 0 {
+		leftWidth = max(28, leftWidth-overflow)
+		left = m.renderList(rows, leftWidth, bodyHeight, selected)
+	}
+	leftRenderedWidth := lipgloss.Width(left)
+	rightRenderedWidth := lipgloss.Width(right)
+	m.detailHeight = max(1, bodyHeight-4)
+	m.leftZone = zone{X1: 0, Y1: m.bodyTop, X2: leftRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "left"}
+	m.rightZone = zone{X1: leftRenderedWidth + gapWidth, Y1: m.bodyTop, X2: leftRenderedWidth + gapWidth + rightRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "right"}
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
 func (m model) renderList(rows []row, width, height, selected int) string {
-	box := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("#324154")).
-		Padding(0, 1).
-		Width(width).
-		Height(height)
-	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#D7E3F0"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-	selectedStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#F9FAFB")).
-		Background(lipgloss.Color("#243447")).
-		Padding(0, 1)
-	idleStyle := lipgloss.NewStyle().Padding(0, 1)
+	box := ui.panelFrame.Width(width).Height(height)
 
 	title := map[viewMode]string{
-		viewTasks:   "Task View",
-		viewMembers: "Member View",
-		viewDates:   "Due Date View",
+		viewTasks:   "Task Queue",
+		viewMembers: "Team Directory",
+		viewDates:   "Due Timeline",
 		viewHelp:    "Manual",
 	}[m.activeView]
 
-	lines := []string{titleStyle.Render(title), muted.Render(m.listHint()), ""}
-	startY := m.bodyTop + 3
+	lines := []string{
+		ui.sectionTitle.Render(title),
+		ui.subtitle.Render(m.listHint()),
+		"",
+	}
+	startY := m.bodyTop + 6
 	y := startY
 
 	if len(rows) == 0 {
-		lines = append(lines, muted.Render("No records yet. Use a, m, t, or n."))
+		lines = append(lines, ui.subtitle.Render("No records yet. Use a, m, t, or n."))
 		return box.Render(strings.Join(lines, "\n"))
 	}
 
-	maxRows := max(1, height-4)
+	innerHeight := max(1, height-4)
+	maxRows := max(1, innerHeight/2)
 	offset := 0
 	if selected >= maxRows {
 		offset = selected - maxRows + 1
@@ -660,107 +830,111 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 
 	for idx := offset; idx < len(rows) && idx < offset+maxRows; idx++ {
 		r := rows[idx]
-		line := fmt.Sprintf("%-2d %s", idx+1, r.Title)
+		lead := ui.metricLabel.Render(fmt.Sprintf("%02d", idx+1))
+		headline := lipgloss.JoinHorizontal(lipgloss.Center, lead, " ", truncate(r.Title, width-12))
+		subtitle := ui.subtitle.Render("   " + truncate(r.Subtitle, width-7))
 		if idx == selected {
-			line = selectedStyle.Width(width - 4).Render(line)
+			lines = append(lines, ui.rowSelected.Width(width-6).Render(headline))
+			lines = append(lines, subtitle)
 		} else {
-			line = idleStyle.Width(width - 4).Render(line)
+			lines = append(lines, ui.rowIdle.Width(width-6).Render(headline))
+			lines = append(lines, subtitle)
 		}
-		lines = append(lines, line)
-		if idx == selected && strings.TrimSpace(r.Subtitle) != "" {
-			lines = append(lines, muted.Render("   "+truncate(r.Subtitle, width-6)))
-			m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + 1, ID: r.ID})
-			y += 2
-			continue
-		}
-		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y, ID: r.ID})
-		y++
+		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + 1, ID: r.ID})
+		y += 2
 	}
 
 	return box.Render(strings.Join(lines, "\n"))
 }
 
 func (m model) renderDetail(width, height int) string {
-	box := lipgloss.NewStyle().
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("#324154")).
-		Padding(0, 1).
-		Width(width).
-		Height(height)
+	box := ui.panelFrameAlt.Width(width).Height(height)
 
-	content := ""
-	switch m.activeView {
-	case viewTasks:
-		content = m.taskDetail()
-	case viewMembers:
-		content = m.memberDetail()
-	case viewDates:
-		content = m.dateDetail()
-	case viewHelp:
-		content = helpManual()
-	}
+	content := m.detailContent()
+	content = renderViewport(content, max(1, width-4), max(1, height-4), m.detailScroll[m.activeView])
 	return box.Render(content)
 }
 
+func (m model) detailContent() string {
+	switch m.activeView {
+	case viewTasks:
+		return m.taskDetail()
+	case viewMembers:
+		return m.memberDetail()
+	case viewDates:
+		return m.dateDetail()
+	case viewHelp:
+		return helpManual()
+	default:
+		return ""
+	}
+}
+
 func (m model) renderStatus() string {
-	hintStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#E5ECF4"))
-	left := statusStyle.Render(truncate(m.lastStatus, max(10, m.width-35)))
-	right := hintStyle.Render("f filter  F clear  a add  n notes  space done  x delete  ? manual  q quit")
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))), right)
+	frameWidth := max(20, m.width)
+	contentWidth := max(20, frameWidth-ui.statusFrame.GetHorizontalFrameSize())
+	left := ui.title.Render(truncate(m.lastStatus, max(10, contentWidth-48)))
+	filter := ui.subtitle.Render(truncate(m.filterSummary(), max(20, contentWidth/3)))
+	right := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		ui.keycap.Render("f"),
+		" filter ",
+		ui.keycap.Render("a"),
+		" add ",
+		ui.keycap.Render("n"),
+		" notes ",
+		ui.keycap.Render("?"),
+		" guide ",
+		ui.keycap.Render("q"),
+		" quit",
+	)
+	row := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		left,
+		strings.Repeat(" ", max(1, contentWidth-lipgloss.Width(left)-lipgloss.Width(filter)-lipgloss.Width(right)-2)),
+		filter,
+		"  ",
+		right,
+	)
+	return ui.statusFrame.Width(frameWidth).Render(row)
 }
 
 func (m model) renderOverlay() string {
-	bg := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#6D8BA7")).
-		Padding(1, 2).
-		Width(min(90, max(54, m.width-10)))
+	bg := ui.modalFrame.Width(min(90, max(54, m.width-10)))
 
 	switch m.overlay {
 	case overlayMember:
 		var lines []string
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Team Member"))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, ui.sectionTitle.Render("Add Team Member"))
+		lines = append(lines, ui.subtitle.Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
 		lines = append(lines, "")
 		labels := []string{"Name", "Role", "Email"}
 		for i, in := range m.memberInputs {
-			label := labels[i]
-			if i == m.formCursor {
-				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
-			}
-			lines = append(lines, label)
+			lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
 			lines = append(lines, in.View())
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayTask:
 		var lines []string
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Task"))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Members can be comma-separated; this creates one task per member."))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, ui.sectionTitle.Render("Add Task"))
+		lines = append(lines, ui.subtitle.Render("Members can be comma-separated; this creates one task per member."))
+		lines = append(lines, ui.subtitle.Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
 		lines = append(lines, "")
 		labels := []string{"Title", "Members", "Category", "Priority", "Tags", "Due Date", "Comments"}
 		for i, in := range m.taskInputs {
-			label := labels[i]
-			if i == m.formCursor {
-				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
-			}
-			lines = append(lines, label)
+			lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
 			lines = append(lines, in.View())
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayNote:
 		lines := []string{
-			lipgloss.NewStyle().Bold(true).Render("Quick Note Capture"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Scope a batch by member and due date, then write tasks underneath. ctrl+s saves, esc cancels."),
+			ui.sectionTitle.Render("Quick Note Capture"),
+			ui.subtitle.Render("Scope a batch by member and due date, then write tasks underneath. ctrl+s saves, esc cancels."),
 			"",
 		}
 		labels := []string{"Default Member", "Default Due Date", "Task Notes"}
 		for i, label := range labels {
-			if i == m.formCursor {
-				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
-			}
-			lines = append(lines, label)
+			lines = append(lines, m.formLabel(label, i == m.formCursor))
 			if i < len(m.noteInputs) {
 				lines = append(lines, m.noteInputs[i].View())
 				continue
@@ -770,16 +944,12 @@ func (m model) renderOverlay() string {
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayFilter:
 		var lines []string
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Filters"))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Filter by text, member, or due date. ctrl+s applies, ctrl+r clears, esc cancels."))
+		lines = append(lines, ui.sectionTitle.Render("Filters"))
+		lines = append(lines, ui.subtitle.Render("Filter by text, member, or due date. ctrl+s applies, ctrl+r clears, esc cancels."))
 		lines = append(lines, "")
 		labels := []string{"Text", "Member", "Due Date"}
 		for i, in := range m.filterInputs {
-			label := labels[i]
-			if i == m.formCursor {
-				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
-			}
-			lines = append(lines, label)
+			lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
 			lines = append(lines, in.View())
 		}
 		return bg.Render(strings.Join(lines, "\n"))
@@ -857,6 +1027,28 @@ func (m model) moveCursor(delta int) model {
 	}
 	m.cursor[m.activeView] += delta
 	m.clampCursor(len(rows))
+	return m
+}
+
+func (m model) scrollByPointer(x, y, delta int) model {
+	if inZone(x, y, m.rightZone) {
+		return m.scrollDetail(delta)
+	}
+	return m.moveCursor(delta)
+}
+
+func (m model) scrollDetail(delta int) model {
+	contentHeight := detailContentHeight(m.detailContent())
+	visibleHeight := max(1, m.detailHeight)
+	maxScroll := max(0, contentHeight-visibleHeight)
+	next := m.detailScroll[m.activeView] + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > maxScroll {
+		next = maxScroll
+	}
+	m.detailScroll[m.activeView] = next
 	return m
 }
 
@@ -1252,12 +1444,9 @@ func (m model) selectedDateGroup() *dateGroup {
 }
 
 func (m model) taskDetail() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-
 	selected := m.selectedTask()
 	if selected == nil {
-		return title.Render("Task Details") + "\n" + muted.Render("Create a task with t or quick capture with n.")
+		return ui.sectionTitle.Render("Task Details") + "\n" + ui.subtitle.Render("Create a task with t or quick capture with n.")
 	}
 
 	memberName := fallback(m.memberName(selected.MemberID), "Unassigned")
@@ -1272,84 +1461,79 @@ func (m model) taskDetail() string {
 	}
 
 	lines := []string{
-		title.Render(selected.Title),
+		ui.sectionTitle.Render(selected.Title),
+		ui.subtitle.Render(strings.ToUpper(fallback(selected.Category, "uncategorized"))),
 		"",
-		fmt.Sprintf("Status    %s", statusChip(selected.Status)),
-		fmt.Sprintf("Member    %s", memberBadge(memberName)),
-		fmt.Sprintf("Category  %s", fallback(selected.Category, "none")),
-		fmt.Sprintf("Priority  %s", priorityChip(selected.Priority)),
-		fmt.Sprintf("Due       %s", dueLabel(selected.DueDate)),
-		fmt.Sprintf("Tags      %s", tagLine),
+		m.detailPair("Status", statusChip(selected.Status)),
+		m.detailPair("Member", memberBadge(memberName)+"  "+memberName),
+		m.detailPair("Priority", priorityChip(selected.Priority)),
+		m.detailPair("Due", dueTone(selected.DueDate)),
+		m.detailPair("Tags", tagLine),
 		"",
-		"Comments",
+		ui.inputLabel.Render("Comments"),
 		commentLine,
 		"",
-		muted.Render(fmt.Sprintf("Created %s", selected.CreatedAt.Format("2006-01-02 15:04"))),
+		ui.subtitle.Render(fmt.Sprintf("Created %s", selected.CreatedAt.Format("2006-01-02 15:04"))),
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (m model) memberDetail() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-
 	selected := m.selectedMember()
 	if selected == nil {
-		return title.Render("Member Details") + "\n" + muted.Render("Add a member with m.")
+		return ui.sectionTitle.Render("Member Details") + "\n" + ui.subtitle.Render("Add a member with m.")
 	}
 
 	tasks := m.tasksForMember(selected.ID)
 	lines := []string{
-		title.Render(selected.Name),
+		ui.sectionTitle.Render(selected.Name),
+		ui.subtitle.Render(strings.ToUpper(fallback(selected.Role, "team member"))),
 		"",
-		fmt.Sprintf("Role     %s", fallback(selected.Role, "none")),
-		fmt.Sprintf("Contact  %s", fallback(selected.Email, "none")),
-		fmt.Sprintf("Badge    %s", memberBadge(selected.Name)),
+		m.detailPair("Role", fallback(selected.Role, "none")),
+		m.detailPair("Contact", fallback(selected.Email, "none")),
+		m.detailPair("Badge", memberBadge(selected.Name)),
 		"",
-		"Tasks",
+		ui.inputLabel.Render("Tasks"),
 	}
 	if len(tasks) == 0 {
-		lines = append(lines, muted.Render("No tasks assigned yet."))
+		lines = append(lines, ui.subtitle.Render("No tasks assigned yet."))
 		return strings.Join(lines, "\n")
 	}
 	for _, t := range tasks {
 		lines = append(lines, "")
 		lines = append(lines, fmt.Sprintf("%s %s", statusChip(t.Status), t.Title))
-		lines = append(lines, fmt.Sprintf("  %s  •  %s  •  %s", fallback(t.Category, "no category"), priorityChip(t.Priority), dueLabel(t.DueDate)))
+		lines = append(lines, ui.subtitle.Render(fmt.Sprintf("  %s  •  %s  •  %s", fallback(t.Category, "no category"), priorityChip(t.Priority), dueLabel(t.DueDate))))
 		if len(t.Tags) > 0 {
-			lines = append(lines, "  tags: "+strings.Join(t.Tags, ", "))
+			lines = append(lines, ui.subtitle.Render("  tags: "+strings.Join(t.Tags, ", ")))
 		}
 		if len(t.Comments) > 0 {
-			lines = append(lines, "  notes: "+strings.Join(t.Comments, " | "))
+			lines = append(lines, ui.subtitle.Render("  notes: "+strings.Join(t.Comments, " | ")))
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (m model) dateDetail() string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8EEF5"))
-	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8"))
-
 	selected := m.selectedDateGroup()
 	if selected == nil {
-		return title.Render("Due Date Details") + "\n" + muted.Render("No due dates yet. Add tasks with a due date.")
+		return ui.sectionTitle.Render("Due Date Details") + "\n" + ui.subtitle.Render("No due dates yet. Add tasks with a due date.")
 	}
 
 	lines := []string{
-		title.Render(dueLabel(selected.Date)),
+		ui.sectionTitle.Render(dueTone(selected.Date)),
 		"",
-		fmt.Sprintf("%d task%s due", len(selected.Tasks), plural(len(selected.Tasks))),
+		ui.subtitle.Render(fmt.Sprintf("%d task%s due", len(selected.Tasks), plural(len(selected.Tasks)))),
 		"",
 	}
 	for _, t := range selected.Tasks {
 		lines = append(lines, "")
 		lines = append(lines, fmt.Sprintf("%s %s", statusChip(t.Status), t.Title))
-		lines = append(lines, fmt.Sprintf("  %s  •  %s  •  %s", memberBadge(fallback(m.memberName(t.MemberID), "Unassigned")), fallback(t.Category, "no category"), priorityChip(t.Priority)))
+		lines = append(lines, ui.subtitle.Render(fmt.Sprintf("  %s  %s  •  %s  •  %s", memberBadge(fallback(m.memberName(t.MemberID), "Unassigned")), fallback(m.memberName(t.MemberID), "Unassigned"), fallback(t.Category, "no category"), priorityChip(t.Priority))))
 		if len(t.Tags) > 0 {
-			lines = append(lines, "  tags: "+strings.Join(t.Tags, ", "))
+			lines = append(lines, ui.subtitle.Render("  tags: "+strings.Join(t.Tags, ", ")))
 		}
 		if len(t.Comments) > 0 {
-			lines = append(lines, "  notes: "+strings.Join(t.Comments, " | "))
+			lines = append(lines, ui.subtitle.Render("  notes: "+strings.Join(t.Comments, " | ")))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -1368,6 +1552,22 @@ func (m model) listHint() string {
 	default:
 		return ""
 	}
+}
+
+func (m model) formLabel(label string, focused bool) string {
+	if focused {
+		return ui.inputLabelFocus.Render("> " + label)
+	}
+	return ui.inputLabel.Render(label)
+}
+
+func (m model) detailPair(label, value string) string {
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		ui.inputLabel.Width(10).Render(label),
+		" ",
+		value,
+	)
 }
 
 func (m model) resizeEditors() {
@@ -1909,6 +2109,51 @@ func helpManual() string {
 	}, "\n")
 }
 
+func (m model) renderMetric(label, value string, accent lipgloss.Color) string {
+	return lipgloss.NewStyle().MarginLeft(1).Render(
+		lipgloss.JoinHorizontal(
+			lipgloss.Center,
+			ui.metricLabel.Render(label),
+			" ",
+			ui.metricValue.Foreground(accent).Render(value),
+		),
+	)
+}
+
+func (m model) openTaskCount() int {
+	count := 0
+	for _, t := range m.state.Tasks {
+		if t.Status != "done" {
+			count++
+		}
+	}
+	return count
+}
+
+func (m model) doneTaskCount() int {
+	count := 0
+	for _, t := range m.state.Tasks {
+		if t.Status == "done" {
+			count++
+		}
+	}
+	return count
+}
+
+func (m model) overdueTaskCount() int {
+	today := time.Now().Format(dateLayout)
+	count := 0
+	for _, t := range m.state.Tasks {
+		if t.Status == "done" || strings.TrimSpace(t.DueDate) == "" {
+			continue
+		}
+		if t.DueDate < today {
+			count++
+		}
+	}
+	return count
+}
+
 func dueLabel(date string) string {
 	if strings.TrimSpace(date) == "" {
 		return "No due date"
@@ -1930,6 +2175,27 @@ func dueLabel(date string) string {
 		return fmt.Sprintf("%s  (%dd)", date, diff)
 	default:
 		return fmt.Sprintf("%s  (%dd overdue)", date, -diff)
+	}
+}
+
+func dueTone(date string) string {
+	label := dueLabel(date)
+	if strings.TrimSpace(date) == "" {
+		return ui.subtitle.Render(label)
+	}
+	t, err := time.Parse(dateLayout, date)
+	if err != nil {
+		return label
+	}
+	today := time.Now()
+	base := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+	switch {
+	case t.Before(base):
+		return lipgloss.NewStyle().Bold(true).Foreground(ui.danger).Render(label)
+	case t.Equal(base):
+		return lipgloss.NewStyle().Bold(true).Foreground(ui.warn).Render(label)
+	default:
+		return lipgloss.NewStyle().Bold(true).Foreground(ui.success).Render(label)
 	}
 }
 
@@ -2074,6 +2340,71 @@ func truncate(value string, width int) string {
 		return string(runes[:width-1]) + "…"
 	}
 	return value
+}
+
+func joinHeaderLine(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	if leftWidth+rightWidth+1 <= width {
+		return left + strings.Repeat(" ", width-leftWidth-rightWidth) + right
+	}
+	if rightWidth >= width {
+		return truncate(right, width)
+	}
+	availableLeft := max(1, width-rightWidth-1)
+	left = truncate(left, availableLeft)
+	leftWidth = lipgloss.Width(left)
+	return left + strings.Repeat(" ", max(1, width-leftWidth-rightWidth)) + right
+}
+
+func renderViewport(content string, width, height, offset int) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
+	maxOffset := max(0, len(lines)-height)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+
+	end := min(len(lines), offset+height)
+	view := make([]string, 0, height)
+	for _, line := range lines[offset:end] {
+		view = append(view, truncate(line, width))
+	}
+	for len(view) < height {
+		view = append(view, "")
+	}
+	return strings.Join(view, "\n")
+}
+
+func detailContentHeight(content string) int {
+	if content == "" {
+		return 1
+	}
+	return len(strings.Split(content, "\n"))
+}
+
+func hideBody() bool {
+	return os.Getenv("PROMAG_HIDE_BODY") != ""
+}
+
+func debugLogf(format string, args ...any) {
+	if debugLogPath == "" {
+		return
+	}
+	f, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
 }
 
 func gSummary(tasks []task, m model) string {
