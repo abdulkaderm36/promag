@@ -28,7 +28,6 @@ const (
 
 var naturalDateParser = when.EN
 var ui = newTheme()
-var debugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_LOG"))
 
 type viewMode string
 
@@ -238,15 +237,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	opts := []tea.ProgramOption{
+	p := tea.NewProgram(
+		newModel(path, state),
+		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 		tea.WithMouseAllMotion(),
-	}
-	if os.Getenv("PROMAG_NO_ALTSCREEN") == "" {
-		opts = append(opts, tea.WithAltScreen())
-	}
-
-	p := tea.NewProgram(newModel(path, state), opts...)
+	)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run app: %v\n", err)
@@ -692,7 +688,6 @@ func (m model) View() string {
 	bodyHeight := max(8, m.height-lipgloss.Height(header)-lipgloss.Height(status)-1)
 	m.bodyHeight = bodyHeight
 	body := m.renderBody(bodyHeight)
-	debugLogf("view width=%d height=%d header_height=%d status_height=%d body_height=%d hide_body=%t", m.width, m.height, lipgloss.Height(header), lipgloss.Height(status), bodyHeight, hideBody())
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 	if m.overlay != overlayNone {
@@ -756,16 +751,10 @@ func (m model) renderHeader() string {
 	}
 	lines = append(lines, "")
 	lines = append(lines, tabsLine)
-	content := strings.Join(lines, "\n")
-	debugLogf("header frame_width=%d content_width=%d lines=%d raw=%q", frameWidth, contentWidth, len(lines), content)
-	return ui.headerFrame.Width(frameWidth).Render(content)
+	return ui.headerFrame.Width(frameWidth).Render(strings.Join(lines, "\n"))
 }
 
 func (m model) renderBody(bodyHeight int) string {
-	if hideBody() {
-		debugLogf("body hidden height=%d", bodyHeight)
-		return strings.Join(make([]string, bodyHeight), "\n")
-	}
 	availableWidth := max(60, m.width)
 	gapWidth := 1
 	leftWidth := max(minLeftWidth, min(availableWidth/2-1, 48))
@@ -2389,22 +2378,6 @@ func detailContentHeight(content string) int {
 		return 1
 	}
 	return len(strings.Split(content, "\n"))
-}
-
-func hideBody() bool {
-	return os.Getenv("PROMAG_HIDE_BODY") != ""
-}
-
-func debugLogf(format string, args ...any) {
-	if debugLogPath == "" {
-		return
-	}
-	f, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
 }
 
 func gSummary(tasks []task, m model) string {
