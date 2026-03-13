@@ -330,13 +330,13 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.openMemberForm()
 			return m, nil
 		}
-		m.openTaskForm("")
+		m.openTaskForm(m.taskFormPrefill())
 		return m, nil
 	case "m":
 		m.openMemberForm()
 		return m, nil
 	case "t":
-		m.openTaskForm(m.prefillMemberNames())
+		m.openTaskForm(m.taskFormPrefill())
 		return m, nil
 	case "n":
 		m.openNoteForm()
@@ -842,7 +842,7 @@ func (m *model) openMemberForm() {
 	m.memberInputs[0].Focus()
 }
 
-func (m *model) openTaskForm(defaultMembers string) {
+func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 	m.overlay = overlayTask
 	m.formCursor = 0
 	for i := range m.taskInputs {
@@ -851,6 +851,9 @@ func (m *model) openTaskForm(defaultMembers string) {
 	}
 	if defaultMembers != "" {
 		m.taskInputs[1].SetValue(defaultMembers)
+	}
+	if defaultDueDate != "" {
+		m.taskInputs[5].SetValue(defaultDueDate)
 	}
 	m.taskInputs[0].Focus()
 }
@@ -1262,15 +1265,20 @@ func (m model) resizeEditors() {
 	}
 }
 
-func (m model) prefillMemberNames() string {
-	if m.activeView != viewMembers {
-		return ""
+func (m model) taskFormPrefill() (defaultMembers, defaultDueDate string) {
+	switch m.activeView {
+	case viewMembers:
+		selected := m.selectedMember()
+		if selected != nil {
+			return selected.Name, ""
+		}
+	case viewDates:
+		selected := m.selectedDateGroup()
+		if selected != nil {
+			return "", selected.Date
+		}
 	}
-	selected := m.selectedMember()
-	if selected == nil {
-		return ""
-	}
-	return selected.Name
+	return "", ""
 }
 
 func (m model) tasksForMember(memberID string) []task {
