@@ -32,6 +32,9 @@ go run .
 - `n`: quick note capture
 - `f` or `/`: open filters
 - `F`: clear filters
+- `tab`: accept a member autocomplete suggestion when available, otherwise move to next field
+- `up` / `down`: move between fields while editing forms
+- `ctrl+j` / `ctrl+k`: move between fields while editing forms
 - `space`: toggle done in Task View
 - `x`: delete selected task or empty member
 - `?`: open manual

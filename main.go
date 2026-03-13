@@ -172,6 +172,7 @@ func newModel(path string, state appState) model {
 		taskInputs[i] = in
 	}
 	taskInputs[0].Focus()
+	taskInputs[1].ShowSuggestions = true
 
 	filterInputs := make([]textinput.Model, 3)
 	filterPlaceholders := []string{
@@ -186,6 +187,7 @@ func newModel(path string, state appState) model {
 		in.CharLimit = 256
 		filterInputs[i] = in
 	}
+	filterInputs[1].ShowSuggestions = true
 
 	noteInputs := make([]textinput.Model, 2)
 	notePlaceholders := []string{
@@ -199,6 +201,7 @@ func newModel(path string, state appState) model {
 		in.CharLimit = 256
 		noteInputs[i] = in
 	}
+	noteInputs[0].ShowSuggestions = true
 
 	noteInput := textarea.New()
 	noteInput.Placeholder = notePlaceholder()
@@ -206,7 +209,7 @@ func newModel(path string, state appState) model {
 	noteInput.SetHeight(14)
 	noteInput.Focus()
 
-	return model{
+	model := model{
 		dataPath:     path,
 		state:        state,
 		activeView:   viewTasks,
@@ -219,6 +222,8 @@ func newModel(path string, state appState) model {
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
 	}
+	model.refreshMemberSuggestions()
+	return model
 }
 
 func (m model) Init() tea.Cmd {
@@ -380,7 +385,7 @@ func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.closeOverlay("Member entry cancelled.")
 		return m, nil
-	case "tab", "shift+tab", "enter", "up", "down", "j", "k":
+	case "tab", "shift+tab", "enter", "ctrl+j", "ctrl+k", "up", "down":
 		s := msg.String()
 		if s == "enter" && m.formCursor == len(m.memberInputs)-1 {
 			if err := m.submitMemberForm(); err != nil {
@@ -411,7 +416,13 @@ func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.closeOverlay("Task entry cancelled.")
 		return m, nil
-	case "tab", "shift+tab", "up", "down", "j", "k":
+	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
+		if msg.String() == "tab" && m.formCursor == 1 && m.taskInputs[1].Focused() && len(m.taskInputs[1].MatchedSuggestions()) > 0 {
+			var cmd tea.Cmd
+			m.taskInputs[1], cmd = m.taskInputs[1].Update(msg)
+			m.refreshMemberSuggestions()
+			return m, cmd
+		}
 		m.navigateForm(len(m.taskInputs), msg.String())
 		return m, nil
 	case "enter":
@@ -436,6 +447,9 @@ func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.taskInputs[m.formCursor], cmd = m.taskInputs[m.formCursor].Update(msg)
+	if m.formCursor == 1 {
+		m.refreshMemberSuggestions()
+	}
 	return m, cmd
 }
 
@@ -444,7 +458,13 @@ func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.closeOverlay("Quick note capture cancelled.")
 		return m, nil
-	case "tab", "shift+tab", "up", "down", "j", "k":
+	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
+		if msg.String() == "tab" && m.formCursor == 0 && m.noteInputs[0].Focused() && len(m.noteInputs[0].MatchedSuggestions()) > 0 {
+			var cmd tea.Cmd
+			m.noteInputs[0], cmd = m.noteInputs[0].Update(msg)
+			m.refreshMemberSuggestions()
+			return m, cmd
+		}
 		m.navigateForm(len(m.noteInputs)+1, msg.String())
 		return m, nil
 	case "ctrl+s":
@@ -460,6 +480,9 @@ func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.formCursor < len(m.noteInputs) {
 		var cmd tea.Cmd
 		m.noteInputs[m.formCursor], cmd = m.noteInputs[m.formCursor].Update(msg)
+		if m.formCursor == 0 {
+			m.refreshMemberSuggestions()
+		}
 		return m, cmd
 	}
 
@@ -473,7 +496,13 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.closeOverlay("Filter edit cancelled.")
 		return m, nil
-	case "tab", "shift+tab", "up", "down", "j", "k":
+	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
+		if msg.String() == "tab" && m.formCursor == 1 && m.filterInputs[1].Focused() && len(m.filterInputs[1].MatchedSuggestions()) > 0 {
+			var cmd tea.Cmd
+			m.filterInputs[1], cmd = m.filterInputs[1].Update(msg)
+			m.refreshMemberSuggestions()
+			return m, cmd
+		}
 		m.navigateForm(len(m.filterInputs), msg.String())
 		return m, nil
 	case "enter":
@@ -502,6 +531,9 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.filterInputs[m.formCursor], cmd = m.filterInputs[m.formCursor].Update(msg)
+	if m.formCursor == 1 {
+		m.refreshMemberSuggestions()
+	}
 	return m, cmd
 }
 
@@ -689,7 +721,7 @@ func (m model) renderOverlay() string {
 	case overlayMember:
 		var lines []string
 		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Team Member"))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab/j/k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
 		lines = append(lines, "")
 		labels := []string{"Name", "Role", "Email"}
 		for i, in := range m.memberInputs {
@@ -705,7 +737,7 @@ func (m model) renderOverlay() string {
 		var lines []string
 		lines = append(lines, lipgloss.NewStyle().Bold(true).Render("Add Task"))
 		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Members can be comma-separated; this creates one task per member."))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab/j/k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
 		lines = append(lines, "")
 		labels := []string{"Title", "Members", "Category", "Priority", "Tags", "Due Date", "Comments"}
 		for i, in := range m.taskInputs {
@@ -893,6 +925,7 @@ func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 	if defaultDueDate != "" {
 		m.taskInputs[5].SetValue(defaultDueDate)
 	}
+	m.refreshMemberSuggestions()
 	m.taskInputs[0].Focus()
 }
 
@@ -908,6 +941,7 @@ func (m *model) openNoteForm() {
 	m.noteInputs[1].SetValue(defaultDueDate)
 	m.noteInput.SetValue("")
 	m.noteInput.Blur()
+	m.refreshMemberSuggestions()
 	m.noteInputs[0].Focus()
 }
 
@@ -919,6 +953,7 @@ func (m *model) openFilterForm() {
 		m.filterInputs[i].SetValue(values[i])
 		m.filterInputs[i].Blur()
 	}
+	m.refreshMemberSuggestions()
 	m.filterInputs[0].Focus()
 }
 
@@ -949,9 +984,9 @@ func (m *model) navigateForm(total int, direction string) {
 	}
 
 	switch direction {
-	case "tab", "down", "j":
+	case "tab", "ctrl+j", "down":
 		m.formCursor = (m.formCursor + 1) % total
-	case "shift+tab", "up", "k":
+	case "shift+tab", "ctrl+k", "up":
 		m.formCursor--
 		if m.formCursor < 0 {
 			m.formCursor = total - 1
@@ -992,6 +1027,7 @@ func (m *model) submitMemberForm() error {
 		Role:  role,
 		Email: email,
 	})
+	m.refreshMemberSuggestions()
 	return saveState(m.dataPath, m.state)
 }
 
@@ -1162,6 +1198,7 @@ func (m model) deleteSelected() model {
 			return m
 		}
 		m.state.Members = slices.DeleteFunc(m.state.Members, func(mem member) bool { return mem.ID == selected.ID })
+		m.refreshMemberSuggestions()
 		if err := saveState(m.dataPath, m.state); err != nil {
 			m.setStatus("save failed: " + err.Error())
 			return m
@@ -1366,6 +1403,65 @@ func (m model) taskFormPrefill() (defaultMembers, defaultDueDate string) {
 		}
 	}
 	return "", ""
+}
+
+func (m *model) refreshMemberSuggestions() {
+	names := m.memberNames()
+	m.taskInputs[1].SetSuggestions(m.memberSuggestionsForValue(m.taskInputs[1].Value(), true))
+	m.filterInputs[1].SetSuggestions(m.memberSuggestionsForValue(m.filterInputs[1].Value(), false))
+	m.noteInputs[0].SetSuggestions(m.memberSuggestionsForValue(m.noteInputs[0].Value(), false))
+	if len(names) == 0 {
+		m.taskInputs[1].SetSuggestions(nil)
+		m.filterInputs[1].SetSuggestions(nil)
+		m.noteInputs[0].SetSuggestions(nil)
+	}
+}
+
+func (m model) memberNames() []string {
+	members := slices.Clone(m.state.Members)
+	sort.Slice(members, func(i, j int) bool {
+		return strings.ToLower(members[i].Name) < strings.ToLower(members[j].Name)
+	})
+	names := make([]string, 0, len(members))
+	for _, mem := range members {
+		names = append(names, mem.Name)
+	}
+	return names
+}
+
+func (m model) memberSuggestionsForValue(value string, multi bool) []string {
+	names := m.memberNames()
+	if !multi {
+		return names
+	}
+
+	raw := value
+	if strings.TrimSpace(raw) == "" {
+		return names
+	}
+
+	lastComma := strings.LastIndex(raw, ",")
+	if lastComma == -1 {
+		return names
+	}
+
+	prefix := raw[:lastComma+1]
+	segment := strings.TrimSpace(raw[lastComma+1:])
+	var suggestions []string
+	for _, name := range names {
+		if segment == "" || strings.HasPrefix(strings.ToLower(name), strings.ToLower(segment)) {
+			candidate := prefix
+			if !strings.HasSuffix(candidate, " ") {
+				candidate += " "
+			}
+			candidate += name
+			suggestions = append(suggestions, candidate)
+		}
+	}
+	if len(suggestions) == 0 {
+		return names
+	}
+	return suggestions
 }
 
 func (m model) tasksForMember(memberID string) []task {
@@ -1777,6 +1873,8 @@ func helpManual() string {
 		"t opens the task form. From Member View it prefills the selected member.",
 		"a is context-aware: add member in Member View, add task elsewhere.",
 		"f or / opens filters. F clears all filters.",
+		"tab accepts an autocomplete suggestion in member fields, otherwise it moves forward.",
+		"up/down arrows and ctrl+j / ctrl+k move between fields while editing forms.",
 		"space toggles a task between open and done in Task View.",
 		"x deletes the selected task, or deletes a member with no remaining tasks.",
 		"n opens batch note capture with default member and due-date scope fields.",
