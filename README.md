@@ -9,7 +9,7 @@ Simple project management TUI in Go for small teams. It uses Bubble Tea for a ke
 - Task metadata: category, priority, tags, comments, due date
 - Three working views: task-based, member-based, and due-date-based
 - Subtle color coding for status, priority, and member identity
-- Quick note capture to create many tasks quickly
+- Batch note capture with default member and due-date scope
 - Mouse support and `nvim`-style navigation
 - Local JSON persistence in `promag-data.json`
 
@@ -40,6 +40,13 @@ go run .
 ## Quick Note Capture
 
 The note view is built for fast entry. You can set defaults once, then write task lines underneath them.
+
+The batch entry modal also has dedicated top fields for:
+
+- default member
+- default due date
+
+If you open it from Member View or Due Date View, those fields are prefilled from the current selection.
 
 ```text
 @Ali,Sara

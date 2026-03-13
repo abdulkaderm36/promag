@@ -107,6 +107,7 @@ type model struct {
 	memberInputs []textinput.Model
 	taskInputs   []textinput.Model
 	filterInputs []textinput.Model
+	noteInputs   []textinput.Model
 	noteInput    textarea.Model
 	formCursor   int
 
@@ -186,6 +187,19 @@ func newModel(path string, state appState) model {
 		filterInputs[i] = in
 	}
 
+	noteInputs := make([]textinput.Model, 2)
+	notePlaceholders := []string{
+		"Default member for all tasks below",
+		"Default due date for all tasks below",
+	}
+	for i := range noteInputs {
+		in := textinput.New()
+		in.Placeholder = notePlaceholders[i]
+		in.Prompt = ""
+		in.CharLimit = 256
+		noteInputs[i] = in
+	}
+
 	noteInput := textarea.New()
 	noteInput.Placeholder = notePlaceholder()
 	noteInput.SetWidth(80)
@@ -200,6 +214,7 @@ func newModel(path string, state appState) model {
 		memberInputs: memberInputs,
 		taskInputs:   taskInputs,
 		filterInputs: filterInputs,
+		noteInputs:   noteInputs,
 		noteInput:    noteInput,
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
@@ -429,6 +444,9 @@ func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.closeOverlay("Quick note capture cancelled.")
 		return m, nil
+	case "tab", "shift+tab", "up", "down", "j", "k":
+		m.navigateForm(len(m.noteInputs)+1, msg.String())
+		return m, nil
 	case "ctrl+s":
 		count, err := m.submitNoteForm()
 		if err != nil {
@@ -437,6 +455,12 @@ func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.closeOverlay(fmt.Sprintf("%d task(s) created from note capture.", count))
 		return m, nil
+	}
+
+	if m.formCursor < len(m.noteInputs) {
+		var cmd tea.Cmd
+		m.noteInputs[m.formCursor], cmd = m.noteInputs[m.formCursor].Update(msg)
+		return m, cmd
 	}
 
 	var cmd tea.Cmd
@@ -696,9 +720,20 @@ func (m model) renderOverlay() string {
 	case overlayNote:
 		lines := []string{
 			lipgloss.NewStyle().Bold(true).Render("Quick Note Capture"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Write fast notes, reuse defaults, and save with ctrl+s. esc cancels."),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#8B96A8")).Render("Scope a batch by member and due date, then write tasks underneath. ctrl+s saves, esc cancels."),
 			"",
-			m.noteInput.View(),
+		}
+		labels := []string{"Default Member", "Default Due Date", "Task Notes"}
+		for i, label := range labels {
+			if i == m.formCursor {
+				label = lipgloss.NewStyle().Foreground(lipgloss.Color("#A7C7E7")).Bold(true).Render("> " + label)
+			}
+			lines = append(lines, label)
+			if i < len(m.noteInputs) {
+				lines = append(lines, m.noteInputs[i].View())
+				continue
+			}
+			lines = append(lines, m.noteInput.View())
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayFilter:
@@ -826,6 +861,9 @@ func (m *model) closeOverlay(status string) {
 	for i := range m.filterInputs {
 		m.filterInputs[i].Blur()
 	}
+	for i := range m.noteInputs {
+		m.noteInputs[i].Blur()
+	}
 	m.noteInput.Blur()
 	if status != "" {
 		m.setStatus(status)
@@ -861,8 +899,16 @@ func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 func (m *model) openNoteForm() {
 	m.overlay = overlayNote
 	m.formCursor = 0
+	defaultMember, defaultDueDate := m.taskFormPrefill()
+	for i := range m.noteInputs {
+		m.noteInputs[i].SetValue("")
+		m.noteInputs[i].Blur()
+	}
+	m.noteInputs[0].SetValue(defaultMember)
+	m.noteInputs[1].SetValue(defaultDueDate)
 	m.noteInput.SetValue("")
-	m.noteInput.Focus()
+	m.noteInput.Blur()
+	m.noteInputs[0].Focus()
 }
 
 func (m *model) openFilterForm() {
@@ -895,6 +941,12 @@ func (m *model) navigateForm(total int, direction string) {
 			m.filterInputs[i].Blur()
 		}
 	}
+	if m.overlay == overlayNote {
+		for i := range m.noteInputs {
+			m.noteInputs[i].Blur()
+		}
+		m.noteInput.Blur()
+	}
 
 	switch direction {
 	case "tab", "down", "j":
@@ -914,6 +966,13 @@ func (m *model) navigateForm(total int, direction string) {
 	}
 	if m.overlay == overlayFilter {
 		m.filterInputs[m.formCursor].Focus()
+	}
+	if m.overlay == overlayNote {
+		if m.formCursor < len(m.noteInputs) {
+			m.noteInputs[m.formCursor].Focus()
+		} else {
+			m.noteInput.Focus()
+		}
 	}
 }
 
@@ -987,7 +1046,11 @@ func (m *model) submitTaskForm() error {
 }
 
 func (m *model) submitNoteForm() (int, error) {
-	tasks, err := parseQuickCapture(m.noteInput.Value(), m.state.Members)
+	prefixed, err := m.noteBatchInput()
+	if err != nil {
+		return 0, err
+	}
+	tasks, err := parseQuickCapture(prefixed, m.state.Members)
 	if err != nil {
 		return 0, err
 	}
@@ -1001,6 +1064,27 @@ func (m *model) submitNoteForm() (int, error) {
 	m.activeView = viewTasks
 	m.cursor[viewTasks] = len(m.filteredTasks()) - 1
 	return len(tasks), nil
+}
+
+func (m model) noteBatchInput() (string, error) {
+	memberName := strings.TrimSpace(m.noteInputs[0].Value())
+	dueDate, err := normalizeDueInput(m.noteInputs[1].Value())
+	if err != nil {
+		return "", err
+	}
+
+	var lines []string
+	if memberName != "" {
+		lines = append(lines, "@"+memberName)
+	}
+	if dueDate != "" {
+		lines = append(lines, "due:"+dueDate)
+	}
+	body := strings.TrimSpace(m.noteInput.Value())
+	if body != "" {
+		lines = append(lines, body)
+	}
+	return strings.Join(lines, "\n"), nil
 }
 
 func (m *model) submitFilterForm() error {
@@ -1262,6 +1346,9 @@ func (m model) resizeEditors() {
 	}
 	for i := range m.filterInputs {
 		m.filterInputs[i].Width = width - 4
+	}
+	for i := range m.noteInputs {
+		m.noteInputs[i].Width = width - 4
 	}
 }
 
@@ -1692,10 +1779,12 @@ func helpManual() string {
 		"f or / opens filters. F clears all filters.",
 		"space toggles a task between open and done in Task View.",
 		"x deletes the selected task, or deletes a member with no remaining tasks.",
-		"n opens quick note capture.",
+		"n opens batch note capture with default member and due-date scope fields.",
 		"? opens this help pane. q quits.",
 		"",
 		"Quick Note Capture",
+		"Use the top fields to scope the batch, then write plain task lines below.",
+		"The selected member or selected due date prefill those scope fields when available.",
 		"Use plain note lines and lightweight tokens.",
 		"Standalone defaults:",
 		"@Ali,Sara sets default assignees for following tasks.",
