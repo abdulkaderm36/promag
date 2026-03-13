@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/olebedev/when"
 )
 
 const (
@@ -24,6 +25,8 @@ const (
 	storageFile  = "promag-data.json"
 	minLeftWidth = 40
 )
+
+var naturalDateParser = when.EN
 
 type viewMode string
 
@@ -157,7 +160,7 @@ func newModel(path string, state appState) model {
 		"Category: backend, design, ops",
 		"Priority: low, medium, high, urgent",
 		"Tags: api,bug,release",
-		"Due date: 2026-03-20",
+		"Due date: 2026-03-20 or tomorrow",
 		"Comments: first note | another note",
 	}
 	for i := range taskInputs {
@@ -173,7 +176,7 @@ func newModel(path string, state appState) model {
 	filterPlaceholders := []string{
 		"Text in title, category, tags, comments",
 		"Member name",
-		"Due date: 2026-03-20",
+		"Due date: 2026-03-20 or next friday",
 	}
 	for i := range filterInputs {
 		in := textinput.New()
@@ -936,16 +939,14 @@ func (m *model) submitTaskForm() error {
 	category := strings.TrimSpace(m.taskInputs[2].Value())
 	priority := normalizePriority(m.taskInputs[3].Value())
 	tags := parseCSV(m.taskInputs[4].Value())
-	dueDate := strings.TrimSpace(m.taskInputs[5].Value())
+	dueDate, err := normalizeDueInput(m.taskInputs[5].Value())
 	comments := splitComments(m.taskInputs[6].Value())
 
 	if title == "" {
 		return errors.New("task title is required")
 	}
-	if dueDate != "" {
-		if _, err := time.Parse(dateLayout, dueDate); err != nil {
-			return errors.New("due date must be YYYY-MM-DD")
-		}
+	if err != nil {
+		return err
 	}
 	if priority == "" {
 		priority = "medium"
@@ -1000,11 +1001,9 @@ func (m *model) submitNoteForm() (int, error) {
 }
 
 func (m *model) submitFilterForm() error {
-	due := strings.TrimSpace(m.filterInputs[2].Value())
-	if due != "" {
-		if _, err := time.Parse(dateLayout, due); err != nil {
-			return errors.New("filter due date must be YYYY-MM-DD")
-		}
+	due, err := normalizeDueInput(m.filterInputs[2].Value())
+	if err != nil {
+		return err
 	}
 	m.filter = filterState{
 		Text:   strings.TrimSpace(m.filterInputs[0].Value()),
@@ -1490,6 +1489,23 @@ func saveState(path string, state appState) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func normalizeDueInput(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if parsed, err := time.ParseInLocation(dateLayout, value, time.Now().Location()); err == nil {
+		return parsed.Format(dateLayout), nil
+	}
+	base := time.Now()
+	result, err := naturalDateParser.Parse(value, base)
+	if err != nil || result == nil {
+		return "", errors.New("due date must be YYYY-MM-DD or natural language like tomorrow, next friday, in 3 days")
+	}
+	parsed := time.Date(result.Time.Year(), result.Time.Month(), result.Time.Day(), 0, 0, 0, 0, base.Location())
+	return parsed.Format(dateLayout), nil
+}
+
 func parseQuickCapture(input string, members []member) ([]task, error) {
 	type defaults struct {
 		memberIDs []string
@@ -1538,11 +1554,9 @@ func parseQuickCapture(input string, members []member) ([]task, error) {
 			continue
 		}
 		if strings.HasPrefix(strings.ToLower(line), "due:") && !strings.HasPrefix(line, "-") {
-			due := strings.TrimSpace(line[4:])
-			if due != "" {
-				if _, err := time.Parse(dateLayout, due); err != nil {
-					return nil, fmt.Errorf("line %d: due date must be YYYY-MM-DD", idx+1)
-				}
+			due, err := normalizeDueInput(line[4:])
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %w", idx+1, err)
 			}
 			ctx.dueDate = due
 			continue
@@ -1579,11 +1593,9 @@ func parseQuickCapture(input string, members []member) ([]task, error) {
 			case strings.HasPrefix(word, "!"):
 				meta.priority = normalizePriority(strings.TrimPrefix(word, "!"))
 			case strings.HasPrefix(strings.ToLower(word), "due:"):
-				date := strings.TrimSpace(word[4:])
-				if date != "" {
-					if _, err := time.Parse(dateLayout, date); err != nil {
-						return nil, fmt.Errorf("line %d: due date must be YYYY-MM-DD", idx+1)
-					}
+				date, err := normalizeDueInput(word[4:])
+				if err != nil {
+					return nil, fmt.Errorf("line %d: %w", idx+1, err)
 				}
 				meta.dueDate = date
 			case strings.HasPrefix(strings.ToLower(word), "tags:"):
@@ -1647,7 +1659,8 @@ due:2026-03-20
 tags:api,release
 
 - Fix token refresh flow // check mobile fallback
-- Review deploy checklist @Ali,Sara #ops !urgent due:2026-03-18
+due:next friday
+- Review deploy checklist @Ali,Sara #ops !urgent
 `)
 }
 
@@ -1680,7 +1693,7 @@ func helpManual() string {
 		"@Ali,Sara sets default assignees for following tasks.",
 		"#backend sets default category.",
 		"!high sets default priority.",
-		"due:2026-03-20 sets default due date.",
+		"due:2026-03-20 or due:next friday sets default due date.",
 		"tags:api,release sets default tags.",
 		"",
 		"Task lines",
@@ -1689,8 +1702,9 @@ func helpManual() string {
 		"// starts a comment captured into the task comments.",
 		"",
 		"Examples",
-		"- Fix login bug @Ali #backend !urgent due:2026-03-18 tags:bug,auth // verify on iOS",
+		"- Fix login bug @Ali #backend !urgent due:tomorrow tags:bug,auth // verify on iOS",
 		"- Draft sprint notes @Sara",
+		"Task form and filter fields also accept: tomorrow, next friday, in 3 days, Mar 20.",
 		"",
 		"Data",
 		"Everything is stored locally in promag-data.json in this project directory.",

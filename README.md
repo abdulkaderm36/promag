@@ -45,11 +45,11 @@ The note view is built for fast entry. You can set defaults once, then write tas
 @Ali,Sara
 #backend
 !high
-due:2026-03-20
+due:next friday
 tags:api,release
 
 - Fix token refresh flow // validate mobile behavior
-- Review deploy checklist @Ali #ops !urgent due:2026-03-18
+- Review deploy checklist @Ali #ops !urgent
 ```
 
 Rules:
@@ -57,10 +57,12 @@ Rules:
 - `@name1,name2` sets assignees
 - `#category` sets category
 - `!priority` sets priority
-- `due:YYYY-MM-DD` sets due date
+- `due:YYYY-MM-DD` or `due:tomorrow` / `due:next friday` sets due date
 - `tags:a,b,c` sets tags
 - `// comment` stores a task comment
 - Inline tokens on a task line override the active defaults
+
+Task form and filter inputs also accept natural language dates like `tomorrow`, `next friday`, `in 3 days`, and `Mar 20`.
 
 ## Data
 
