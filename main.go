@@ -26,6 +26,7 @@ const (
 	appTitle     = "ProMag"
 	dateLayout   = "2006-01-02"
 	storageFile  = "promag-data.json"
+	configFile   = "promag-config.json"
 	minLeftWidth = 40
 )
 
@@ -48,12 +49,13 @@ const (
 type overlayMode string
 
 const (
-	overlayNone    overlayMode = ""
-	overlayActions overlayMode = "actions"
-	overlayMember  overlayMode = "member"
-	overlayTask    overlayMode = "task"
-	overlayNote    overlayMode = "note"
-	overlayFilter  overlayMode = "filter"
+	overlayNone     overlayMode = ""
+	overlayActions  overlayMode = "actions"
+	overlayMember   overlayMode = "member"
+	overlayTask     overlayMode = "task"
+	overlayNote     overlayMode = "note"
+	overlayFilter   overlayMode = "filter"
+	overlaySettings overlayMode = "settings"
 )
 
 type zone struct {
@@ -90,6 +92,26 @@ type appState struct {
 	Tasks   []task   `json:"tasks"`
 }
 
+type appConfig struct {
+	LeftWheelMode string `json:"left_wheel_mode"`
+}
+
+func defaultConfig() appConfig {
+	return appConfig{
+		LeftWheelMode: "scroll_list",
+	}
+}
+
+func (c appConfig) leftWheelMode() string {
+	mode := strings.TrimSpace(strings.ToLower(c.LeftWheelMode))
+	switch mode {
+	case "move_selection", "scroll_list":
+		return mode
+	default:
+		return defaultConfig().LeftWheelMode
+	}
+}
+
 type row struct {
 	Title    string
 	Subtitle string
@@ -110,8 +132,9 @@ type layoutState struct {
 }
 
 type model struct {
-	dataPath string
-	state    appState
+	dataPath   string
+	configPath string
+	state      appState
 
 	width   int
 	height  int
@@ -134,6 +157,7 @@ type model struct {
 	editingTaskID   string
 	editingMemberID string
 	mouseEnabled    bool
+	config          appConfig
 
 	memberInputs []textinput.Model
 	taskInputs   []textinput.Model
@@ -145,6 +169,7 @@ type model struct {
 	pendingG     bool
 	filter       filterState
 	detailScroll map[viewMode]int
+	listOffset   map[viewMode]int
 }
 
 type filterState struct {
@@ -268,13 +293,19 @@ func main() {
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
 
 	path := filepath.Join(".", storageFile)
+	configPath := filepath.Join(".", configFile)
 	state, err := loadState(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load state: %v\n", err)
 		os.Exit(1)
 	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		os.Exit(1)
+	}
 
-	model := newModel(path, state)
+	model := newModel(path, configPath, state, cfg)
 	if width, height, ok := detectTerminalSize(); ok {
 		model.width = width
 		model.height = height
@@ -297,7 +328,7 @@ func main() {
 	}
 }
 
-func newModel(path string, state appState) model {
+func newModel(path, configPath string, state appState, cfg appConfig) model {
 	memberInputs := make([]textinput.Model, 3)
 	memberPlaceholders := []string{"Member name", "Role or specialty", "Email or handle"}
 	for i := range memberInputs {
@@ -366,7 +397,9 @@ func newModel(path string, state appState) model {
 
 	model := model{
 		dataPath:     path,
+		configPath:   configPath,
 		state:        state,
+		config:       cfg,
 		activeView:   viewTasks,
 		cursor:       map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 		memberInputs: memberInputs,
@@ -378,6 +411,7 @@ func newModel(path string, state appState) model {
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
 		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
+		listOffset:   map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 	}
 	model.refreshMemberSuggestions()
 	return model
@@ -434,6 +468,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			logMouseEvent("mouse hit tab: id=%s zone=(%d,%d)-(%d,%d)", z.ID, z.X1, z.Y1, z.X2, z.Y2)
 			m.activeView = viewMode(z.ID)
 			m.pendingG = false
+			m.ensureCursorVisible()
 			return m, nil
 		}
 	}
@@ -445,6 +480,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			for idx, r := range rows {
 				if r.ID == z.ID {
 					m.cursor[m.activeView] = idx
+					m.ensureCursorVisible()
 					break
 				}
 			}
@@ -468,6 +504,8 @@ func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleNoteForm(msg)
 	case overlayFilter:
 		return m.handleFilterForm(msg)
+	case overlaySettings:
+		return m.handleSettingsForm(msg)
 	default:
 		return m, nil
 	}
@@ -501,9 +539,11 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "tab", "l", "right":
 		m.nextView()
+		m.ensureCursorVisible()
 		return m, nil
 	case "shift+tab", "h", "left":
 		m.prevView()
+		m.ensureCursorVisible()
 		return m, nil
 	case "j", "down":
 		return m.moveCursor(1), nil
@@ -525,6 +565,7 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pendingG {
 			m.cursor[m.activeView] = 0
 			m.pendingG = false
+			m.ensureCursorVisible()
 			return m, nil
 		}
 		m.pendingG = true
@@ -532,6 +573,7 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "G":
 		m.cursor[m.activeView] = max(0, len(m.rowsForView())-1)
 		m.pendingG = false
+		m.ensureCursorVisible()
 		return m, nil
 	case "]":
 		return m.scrollDetail(1), nil
@@ -566,6 +608,9 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n":
 		m.openNoteForm()
+		return m, nil
+	case "s":
+		m.openSettings()
 		return m, nil
 	case "/", "f":
 		m.openFilterForm()
@@ -755,6 +800,29 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Settings cancelled.")
+		return m, nil
+	case "up", "down", "tab", "shift+tab", "ctrl+j", "ctrl+k":
+		if m.config.leftWheelMode() == "scroll_list" {
+			m.config.LeftWheelMode = "move_selection"
+		} else {
+			m.config.LeftWheelMode = "scroll_list"
+		}
+		return m, nil
+	case "enter", "ctrl+s":
+		if err := saveConfig(m.configPath, m.config); err != nil {
+			m.setStatus(fmt.Sprintf("save config: %v", err))
+			return m, nil
+		}
+		m.closeOverlay("Settings saved.")
+		return m, nil
+	}
+	return m, nil
+}
+
 func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -793,6 +861,10 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f", "/":
 		m.closeOverlay("")
 		m.openFilterForm()
+		return m, nil
+	case "s":
+		m.closeOverlay("")
+		m.openSettings()
 		return m, nil
 	case "z":
 		m.closeOverlay("")
@@ -947,9 +1019,13 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 	}
 	rowHeight++
 	maxRows := max(1, innerHeight/rowHeight)
-	offset := 0
-	if selected >= maxRows {
-		offset = selected - maxRows + 1
+	offset := m.listOffset[m.activeView]
+	maxOffset := max(0, len(rows)-maxRows)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
 	}
 
 	for idx := offset; idx < len(rows) && idx < offset+maxRows; idx++ {
@@ -1053,6 +1129,8 @@ func (m model) renderStatus() string {
 		lipgloss.Top,
 		ui.keycap.Render(":"),
 		" actions ",
+		ui.keycap.Render("s"),
+		" settings ",
 		ui.keycap.Render("M"),
 		" mouse ",
 		ui.keycap.Render("q"),
@@ -1081,6 +1159,7 @@ func (m model) renderOverlay() string {
 			"  m   Add Team Member",
 			"  n   Quick Note Capture",
 			"  f   Filters",
+			"  s   Settings",
 			"  z   Archive Completed Task",
 			"  r   Restore Archived Task",
 			"  x   Delete Selected",
@@ -1138,6 +1217,28 @@ func (m model) renderOverlay() string {
 		for i, in := range m.filterInputs {
 			lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
 			lines = append(lines, in.View())
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	case overlaySettings:
+		mode := m.config.leftWheelMode()
+		scrollList := ui.subtitle.Render("scroll_list")
+		moveSelection := ui.subtitle.Render("move_selection")
+		if mode == "scroll_list" {
+			scrollList = ui.eyebrow.Render("scroll_list")
+		}
+		if mode == "move_selection" {
+			moveSelection = ui.eyebrow.Render("move_selection")
+		}
+		lines := []string{
+			ui.sectionTitle.Render("Settings"),
+			ui.subtitle.Render("up/down or tab toggles. enter or ctrl+s saves. esc cancels."),
+			"",
+			ui.inputLabelFocus.Render("Left wheel behavior"),
+			"  " + scrollList,
+			"  " + moveSelection,
+			"",
+			ui.subtitle.Render("scroll_list keeps the selected task pinned while the list viewport moves."),
+			ui.subtitle.Render("move_selection makes the wheel move the selected row directly."),
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	default:
@@ -1228,6 +1329,7 @@ func (m model) moveCursor(delta int) model {
 	}
 	m.cursor[m.activeView] += delta
 	m.clampCursor(len(rows))
+	m.ensureCursorVisible()
 	return m
 }
 
@@ -1235,6 +1337,10 @@ func (m model) scrollByPointer(x, y, delta int) model {
 	if inZone(x, y, currentLayout.rightZone) {
 		logMouseEvent("scroll target: right detail pane")
 		return m.scrollDetail(delta)
+	}
+	if m.config.leftWheelMode() == "scroll_list" {
+		logMouseEvent("scroll target: left list viewport")
+		return m.scrollList(delta)
 	}
 	logMouseEvent("scroll target: left list pane")
 	return m.moveCursor(delta)
@@ -1268,6 +1374,47 @@ func (m model) scrollDetail(delta int) model {
 	}
 	m.detailScroll[m.activeView] = next
 	return m
+}
+
+func (m model) scrollList(delta int) model {
+	rows := m.rowsForView()
+	maxOffset := max(0, len(rows)-m.maxVisibleRows())
+	next := m.listOffset[m.activeView] + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > maxOffset {
+		next = maxOffset
+	}
+	m.listOffset[m.activeView] = next
+	return m
+}
+
+func (m *model) ensureCursorVisible() {
+	maxRows := m.maxVisibleRows()
+	if maxRows <= 0 {
+		return
+	}
+	offset := m.listOffset[m.activeView]
+	cursor := m.cursor[m.activeView]
+	if cursor < offset {
+		m.listOffset[m.activeView] = cursor
+		return
+	}
+	if cursor >= offset+maxRows {
+		m.listOffset[m.activeView] = cursor - maxRows + 1
+	}
+}
+
+func (m model) maxVisibleRows() int {
+	headerLines := 3
+	innerHeight := max(1, m.bodyHeight-4-headerLines)
+	rowHeight := 2
+	if m.activeView == viewTasks {
+		rowHeight = 3
+	}
+	rowHeight++
+	return max(1, innerHeight/rowHeight)
 }
 
 func (m model) detailViewportContent() string {
@@ -1421,6 +1568,11 @@ func (m *model) openTaskEditForm(selected *task) {
 
 func (m *model) openActionMenu() {
 	m.overlay = overlayActions
+	m.formCursor = 0
+}
+
+func (m *model) openSettings() {
+	m.overlay = overlaySettings
 	m.formCursor = 0
 }
 
@@ -2314,6 +2466,35 @@ func loadState(path string) (appState, error) {
 	return state, err
 }
 
+func loadConfig(path string) (appConfig, error) {
+	cfg := defaultConfig()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cfg, saveConfig(path, cfg)
+	}
+	if err != nil {
+		return cfg, err
+	}
+	if len(data) == 0 {
+		return cfg, nil
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.leftWheelMode() == "" {
+		cfg.LeftWheelMode = defaultConfig().LeftWheelMode
+	}
+	return cfg, nil
+}
+
+func saveConfig(path string, cfg appConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
 func saveState(path string, state appState) error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -2527,6 +2708,8 @@ func helpManual(width int) string {
 		"",
 		"Data",
 		"Everything is stored locally in promag-data.json in this project directory.",
+		"Behavior settings live in promag-config.json.",
+		"Use s to open settings in-app.",
 		"Due dates use YYYY-MM-DD.",
 		"Task form supports comma-separated members and will create one task per member.",
 		"Mouse: click tabs or list rows, wheel to scroll.",
@@ -2545,6 +2728,7 @@ func manualKeybindTable(width int) string {
 		{"left click", "Select a tab or row"},
 		{"M", "Toggle app mouse vs terminal selection"},
 		{"m", "Open member form"},
+		{"s", "Open settings"},
 		{"e", "Edit selected task or member"},
 		{"t", "Open task form"},
 		{"a", "Context-aware add action"},
