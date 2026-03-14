@@ -2710,6 +2710,7 @@ func helpManual(width int) string {
 		"Everything is stored locally in promag-data.json in this project directory.",
 		"Behavior settings live in promag-config.json.",
 		"Use s to open settings in-app.",
+		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",
 		"Due dates use YYYY-MM-DD.",
 		"Task form supports comma-separated members and will create one task per member.",
 		"Mouse: click tabs or list rows, wheel to scroll.",
