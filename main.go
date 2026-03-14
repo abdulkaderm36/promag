@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/olebedev/when"
 )
 
@@ -41,11 +42,12 @@ const (
 type overlayMode string
 
 const (
-	overlayNone   overlayMode = ""
-	overlayMember overlayMode = "member"
-	overlayTask   overlayMode = "task"
-	overlayNote   overlayMode = "note"
-	overlayFilter overlayMode = "filter"
+	overlayNone    overlayMode = ""
+	overlayActions overlayMode = "actions"
+	overlayMember  overlayMode = "member"
+	overlayTask    overlayMode = "task"
+	overlayNote    overlayMode = "note"
+	overlayFilter  overlayMode = "filter"
 )
 
 type zone struct {
@@ -409,6 +411,8 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.overlay {
+	case overlayActions:
+		return m.handleActionMenu(msg)
 	case overlayMember:
 		return m.handleMemberForm(msg)
 	case overlayTask:
@@ -429,6 +433,9 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.activeView = viewHelp
 		m.setStatus("Manual opened.")
+		return m, nil
+	case ":":
+		m.openActionMenu()
 		return m, nil
 	case "1":
 		m.activeView = viewTasks
@@ -565,15 +572,11 @@ func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.navigateForm(len(m.taskInputs), msg.String())
 		return m, nil
 	case "enter":
-		if m.formCursor == len(m.taskInputs)-1 {
-			if err := m.submitTaskForm(); err != nil {
-				m.setStatus(err.Error())
-				return m, nil
-			}
-			m.closeOverlay("Task saved.")
+		if err := m.submitTaskForm(); err != nil {
+			m.setStatus(err.Error())
 			return m, nil
 		}
-		m.navigateForm(len(m.taskInputs), "tab")
+		m.closeOverlay("Task saved.")
 		return m, nil
 	case "ctrl+s":
 		if err := m.submitTaskForm(); err != nil {
@@ -645,15 +648,11 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.navigateForm(len(m.filterInputs), msg.String())
 		return m, nil
 	case "enter":
-		if m.formCursor == len(m.filterInputs)-1 {
-			if err := m.submitFilterForm(); err != nil {
-				m.setStatus(err.Error())
-				return m, nil
-			}
-			m.closeOverlay(m.filterSummary())
+		if err := m.submitFilterForm(); err != nil {
+			m.setStatus(err.Error())
 			return m, nil
 		}
-		m.navigateForm(len(m.filterInputs), "tab")
+		m.closeOverlay(m.filterSummary())
 		return m, nil
 	case "ctrl+s":
 		if err := m.submitFilterForm(); err != nil {
@@ -676,6 +675,46 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.closeOverlay("Action menu closed.")
+		return m, nil
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "?":
+		m.closeOverlay("")
+		m.activeView = viewHelp
+		m.setStatus("Manual opened.")
+		return m, nil
+	case "a":
+		m.closeOverlay("")
+		if m.activeView == viewMembers {
+			m.openMemberForm()
+		} else {
+			m.openTaskForm(m.taskFormPrefill())
+		}
+		return m, nil
+	case "m":
+		m.closeOverlay("")
+		m.openMemberForm()
+		return m, nil
+	case "t":
+		m.closeOverlay("")
+		m.openTaskForm(m.taskFormPrefill())
+		return m, nil
+	case "n":
+		m.closeOverlay("")
+		m.openNoteForm()
+		return m, nil
+	case "f", "/":
+		m.closeOverlay("")
+		m.openFilterForm()
+		return m, nil
+	}
+	return m, nil
+}
+
 func (m model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ui.subtitle.Render("loading...")
@@ -695,7 +734,7 @@ func (m model) View() string {
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 	if m.overlay != overlayNone {
-		screen = screen + "\n" + m.renderOverlay()
+		screen = placeOverlay(screen, m.renderOverlay(), m.width, m.height)
 	}
 	return screen
 }
@@ -858,14 +897,8 @@ func (m model) renderStatus() string {
 	center := ui.subtitle.Render(truncate(m.filterSummary(), max(16, contentWidth/3)))
 	hints := lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		ui.keycap.Render("f"),
-		" filter ",
-		ui.keycap.Render("a"),
-		" add ",
-		ui.keycap.Render("n"),
-		" notes ",
-		ui.keycap.Render("?"),
-		" guide ",
+		ui.keycap.Render(":"),
+		" actions ",
 		ui.keycap.Render("q"),
 		" quit",
 	)
@@ -882,6 +915,21 @@ func (m model) renderOverlay() string {
 	bg := ui.modalFrame.Width(min(90, max(54, m.width-10)))
 
 	switch m.overlay {
+	case overlayActions:
+		lines := []string{
+			ui.sectionTitle.Render("Actions"),
+			ui.subtitle.Render("Press a key to open the matching modal. esc cancels."),
+			"",
+			"  t   Add Task",
+			"  m   Add Team Member",
+			"  n   Quick Note Capture",
+			"  f   Filters",
+			"  ?   Manual",
+			"  q   Quit",
+			"",
+			ui.subtitle.Render("a still follows context: member in Team view, task elsewhere."),
+		}
+		return bg.Render(strings.Join(lines, "\n"))
 	case overlayMember:
 		var lines []string
 		lines = append(lines, ui.sectionTitle.Render("Add Team Member"))
@@ -897,7 +945,7 @@ func (m model) renderOverlay() string {
 		var lines []string
 		lines = append(lines, ui.sectionTitle.Render("Add Task"))
 		lines = append(lines, ui.subtitle.Render("Members can be comma-separated; this creates one task per member."))
-		lines = append(lines, ui.subtitle.Render("tab, arrows, or ctrl+j/ctrl+k to move, ctrl+s to save, esc to cancel"))
+		lines = append(lines, ui.subtitle.Render("tab, arrows, or ctrl+j/ctrl+k to move. enter or ctrl+s saves. esc cancels."))
 		lines = append(lines, "")
 		labels := []string{"Title", "Members", "Category", "Priority", "Tags", "Due Date", "Comments"}
 		for i, in := range m.taskInputs {
@@ -924,7 +972,7 @@ func (m model) renderOverlay() string {
 	case overlayFilter:
 		var lines []string
 		lines = append(lines, ui.sectionTitle.Render("Filters"))
-		lines = append(lines, ui.subtitle.Render("Filter by text, member, or due date. ctrl+s applies, ctrl+r clears, esc cancels."))
+		lines = append(lines, ui.subtitle.Render("Filter by text, member, or due date. enter or ctrl+s applies. ctrl+r clears. esc cancels."))
 		lines = append(lines, "")
 		labels := []string{"Text", "Member", "Due Date"}
 		for i, in := range m.filterInputs {
@@ -1126,6 +1174,11 @@ func (m *model) openFilterForm() {
 	}
 	m.refreshMemberSuggestions()
 	m.filterInputs[0].Focus()
+}
+
+func (m *model) openActionMenu() {
+	m.overlay = overlayActions
+	m.formCursor = 0
 }
 
 func (m *model) navigateForm(total int, direction string) {
@@ -2073,6 +2126,7 @@ func helpManual() string {
 func manualKeybindTable() string {
 	rows := [][2]string{
 		{"1 / 2 / 3 / 4", "Jump to Tasks, Team, Timeline, Help"},
+		{":", "Open action palette"},
 		{"tab / shift+tab", "Cycle views"},
 		{"h / l", "Previous / next view"},
 		{"j / k, arrows", "Move through the active list"},
@@ -2085,6 +2139,8 @@ func manualKeybindTable() string {
 		{"f or /", "Open filters"},
 		{"F", "Clear all filters"},
 		{"tab", "Accept autocomplete or move forward in forms"},
+		{"enter", "Save task or apply filters"},
+		{"ctrl+s", "Save task, member, note, or filters"},
 		{"up/down, ctrl+j/k", "Move between form fields"},
 		{"space", "Toggle done in Task View"},
 		{"x", "Delete selected task or empty member"},
@@ -2422,6 +2478,29 @@ func detailContentHeight(content string) int {
 		return 1
 	}
 	return len(strings.Split(content, "\n"))
+}
+
+func placeOverlay(base, overlay string, width, height int) string {
+	base = lipgloss.Place(width, height, lipgloss.Left, lipgloss.Top, base)
+	baseLines := strings.Split(base, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+	overlayWidth := ansi.StringWidth(overlayLines[0])
+	overlayHeight := len(overlayLines)
+	startX := max(0, (width-overlayWidth)/2)
+	startY := max(0, (height-overlayHeight)/2)
+
+	for y, line := range overlayLines {
+		targetY := startY + y
+		if targetY < 0 || targetY >= len(baseLines) {
+			continue
+		}
+		baseLine := lipgloss.PlaceHorizontal(width, lipgloss.Left, baseLines[targetY])
+		left := ansi.Cut(baseLine, 0, startX)
+		right := ansi.Cut(baseLine, startX+ansi.StringWidth(line), width)
+		baseLines[targetY] = left + line + right
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
 func gSummary(tasks []task, m model) string {
