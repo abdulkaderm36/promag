@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -17,6 +18,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/term"
 	"github.com/olebedev/when"
 )
 
@@ -29,6 +31,9 @@ const (
 
 var naturalDateParser = when.EN
 var ui = newTheme()
+var mouseDebugLogPath string
+var mouseDebugOverlay bool
+var currentLayout layoutState
 
 type viewMode string
 
@@ -93,6 +98,16 @@ type row struct {
 	ID       string
 }
 
+type layoutState struct {
+	tabZones     []zone
+	rowZones     []zone
+	leftZone     zone
+	rightZone    zone
+	bodyTop      int
+	bodyHeight   int
+	detailHeight int
+}
+
 type model struct {
 	dataPath string
 	state    appState
@@ -117,6 +132,7 @@ type model struct {
 
 	editingTaskID   string
 	editingMemberID string
+	mouseEnabled    bool
 
 	memberInputs []textinput.Model
 	taskInputs   []textinput.Model
@@ -240,6 +256,16 @@ func newTheme() theme {
 }
 
 func main() {
+	debugFlag := flag.Bool("debug", false, "enable debug logging")
+	debugHitboxesFlag := flag.Bool("debug-hitboxes", false, "draw mouse hit zones on screen")
+	flag.Parse()
+
+	mouseDebugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_MOUSE"))
+	if *debugFlag && mouseDebugLogPath == "" {
+		mouseDebugLogPath = filepath.Join(os.TempDir(), "promag-mouse.log")
+	}
+	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
+
 	path := filepath.Join(".", storageFile)
 	state, err := loadState(path)
 	if err != nil {
@@ -247,16 +273,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	model := newModel(path, state)
+	if width, height, ok := detectTerminalSize(); ok {
+		model.width = width
+		model.height = height
+		model.resizeEditors()
+	}
+
 	p := tea.NewProgram(
-		newModel(path, state),
+		model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
-		tea.WithMouseAllMotion(),
 	)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run app: %v\n", err)
 		os.Exit(1)
+	}
+
+	if (*debugFlag || mouseDebugOverlay) && mouseDebugLogPath != "" {
+		fmt.Fprintf(os.Stderr, "debug log: %s\n", mouseDebugLogPath)
 	}
 }
 
@@ -337,6 +373,7 @@ func newModel(path string, state appState) model {
 		filterInputs: filterInputs,
 		noteInputs:   noteInputs,
 		noteInput:    noteInput,
+		mouseEnabled: true,
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
 		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
@@ -369,36 +406,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	logMouseEvent("mouse event: action=%v button=%v x=%d y=%d overlay=%s mouse_enabled=%t active_view=%s", msg.Action, msg.Button, msg.X, msg.Y, m.overlay, m.mouseEnabled, m.activeView)
+	if !m.mouseEnabled {
+		logMouseEvent("mouse ignored: mouse disabled")
+		return m, nil
+	}
 	if msg.Action != tea.MouseActionPress {
 		if msg.Button == tea.MouseButtonWheelUp {
+			logMouseEvent("mouse scroll: direction=up target=%s", m.mouseTarget(msg.X, msg.Y))
 			return m.scrollByPointer(msg.X, msg.Y, -1), nil
 		}
 		if msg.Button == tea.MouseButtonWheelDown {
+			logMouseEvent("mouse scroll: direction=down target=%s", m.mouseTarget(msg.X, msg.Y))
 			return m.scrollByPointer(msg.X, msg.Y, 1), nil
 		}
+		logMouseEvent("mouse ignored: non-press action without wheel")
 		return m, nil
 	}
 
 	if msg.Button == tea.MouseButtonWheelUp {
+		logMouseEvent("mouse scroll press: direction=up target=%s", m.mouseTarget(msg.X, msg.Y))
 		return m.scrollByPointer(msg.X, msg.Y, -1), nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
+		logMouseEvent("mouse scroll press: direction=down target=%s", m.mouseTarget(msg.X, msg.Y))
 		return m.scrollByPointer(msg.X, msg.Y, 1), nil
 	}
 	if msg.Button != tea.MouseButtonLeft || m.overlay != overlayNone {
+		logMouseEvent("mouse ignored: button=%v overlay=%s", msg.Button, m.overlay)
 		return m, nil
 	}
 
-	for _, z := range m.tabZones {
+	for _, z := range currentLayout.tabZones {
 		if inZone(msg.X, msg.Y, z) {
+			logMouseEvent("mouse hit tab: id=%s zone=(%d,%d)-(%d,%d)", z.ID, z.X1, z.Y1, z.X2, z.Y2)
 			m.activeView = viewMode(z.ID)
 			m.pendingG = false
 			return m, nil
 		}
 	}
 
-	for _, z := range m.rowZones {
+	for _, z := range currentLayout.rowZones {
 		if inZone(msg.X, msg.Y, z) {
+			logMouseEvent("mouse hit row: id=%s zone=(%d,%d)-(%d,%d)", z.ID, z.X1, z.Y1, z.X2, z.Y2)
 			rows := m.rowsForView()
 			for idx, r := range rows {
 				if r.ID == z.ID {
@@ -410,6 +460,7 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	logMouseEvent("mouse miss: target=%s tabs=%d rows=%d left_zone=(%d,%d)-(%d,%d) right_zone=(%d,%d)-(%d,%d)", m.mouseTarget(msg.X, msg.Y), len(currentLayout.tabZones), len(currentLayout.rowZones), currentLayout.leftZone.X1, currentLayout.leftZone.Y1, currentLayout.leftZone.X2, currentLayout.leftZone.Y2, currentLayout.rightZone.X1, currentLayout.rightZone.Y1, currentLayout.rightZone.X2, currentLayout.rightZone.Y2)
 	return m, nil
 }
 
@@ -508,6 +559,14 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		m.openMemberForm()
 		return m, nil
+	case "M":
+		m.mouseEnabled = !m.mouseEnabled
+		if m.mouseEnabled {
+			m.setStatus("Mouse enabled: click and scroll active.")
+			return m, tea.EnableMouseCellMotion
+		}
+		m.setStatus("Mouse disabled: terminal selection/copy available.")
+		return m, tea.DisableMouse
 	case "e":
 		return m.editSelected(), nil
 	case "t":
@@ -761,21 +820,23 @@ func (m model) View() string {
 		return ui.subtitle.Render("loading...")
 	}
 
-	m.tabZones = nil
-	m.rowZones = nil
-	m.leftZone = zone{}
-	m.rightZone = zone{}
+	currentLayout = layoutState{}
 
 	header := m.renderHeader()
 	m.bodyTop = lipgloss.Height(header)
+	currentLayout.bodyTop = m.bodyTop
 	status := m.renderStatus()
 	bodyHeight := max(8, m.height-lipgloss.Height(header)-lipgloss.Height(status)-1)
 	m.bodyHeight = bodyHeight
+	currentLayout.bodyHeight = bodyHeight
 	body := m.renderBody(bodyHeight)
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 	if m.overlay != overlayNone {
 		screen = placeOverlay(screen, m.renderOverlay(), m.width, m.height)
+	}
+	if mouseDebugOverlay {
+		screen = renderMouseDebugOverlay(screen, m.width, m.height)
 	}
 	return screen
 }
@@ -794,8 +855,8 @@ func (m model) renderHeader() string {
 
 	logo := m.renderLogo(contentWidth)
 	logoHeight := lipgloss.Height(logo)
-	tabY := logoHeight + 2
-	x := 0
+	tabY := logoHeight + 1
+	x := 1
 	tabParts := make([]string, 0, len(views))
 	for _, v := range views {
 		label := labels[v]
@@ -805,7 +866,7 @@ func (m model) renderHeader() string {
 		}
 		rendered := style.Render(label)
 		w := lipgloss.Width(rendered)
-		m.tabZones = append(m.tabZones, zone{X1: x, Y1: tabY, X2: x + w - 1, Y2: tabY, ID: string(v)})
+		currentLayout.tabZones = append(currentLayout.tabZones, zone{X1: x, Y1: tabY, X2: x + w - 1, Y2: tabY, ID: string(v)})
 		x += w + 1
 		tabParts = append(tabParts, rendered)
 	}
@@ -855,8 +916,9 @@ func (m model) renderBody(bodyHeight int) string {
 	leftRenderedWidth := lipgloss.Width(left)
 	rightRenderedWidth := lipgloss.Width(right)
 	m.detailHeight = max(1, bodyHeight-4)
-	m.leftZone = zone{X1: 0, Y1: m.bodyTop, X2: leftRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "left"}
-	m.rightZone = zone{X1: leftRenderedWidth + gapWidth, Y1: m.bodyTop, X2: leftRenderedWidth + gapWidth + rightRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "right"}
+	currentLayout.detailHeight = m.detailHeight
+	currentLayout.leftZone = zone{X1: 0, Y1: m.bodyTop, X2: leftRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "left"}
+	currentLayout.rightZone = zone{X1: leftRenderedWidth + gapWidth, Y1: m.bodyTop, X2: leftRenderedWidth + gapWidth + rightRenderedWidth - 1, Y2: m.bodyTop + bodyHeight - 1, ID: "right"}
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
@@ -876,7 +938,9 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 		ui.subtitle.Render(m.listHint()),
 		"",
 	}
-	startY := m.bodyTop + 6
+	frameInsetX := box.GetHorizontalFrameSize() / 2
+	frameInsetY := box.GetVerticalFrameSize() / 2
+	startY := m.bodyTop + frameInsetY + len(lines)
 	y := startY
 
 	if len(rows) == 0 {
@@ -944,7 +1008,13 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 			rowSpan = 3
 		}
 		rowSpan++
-		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + rowSpan - 1, ID: r.ID})
+		currentLayout.rowZones = append(currentLayout.rowZones, zone{
+			X1: frameInsetX,
+			Y1: y,
+			X2: frameInsetX + indicatorWidth + cardWidth - 1,
+			Y2: y + rowSpan - 1,
+			ID: r.ID,
+		})
 		y += rowSpan
 	}
 
@@ -990,6 +1060,8 @@ func (m model) renderStatus() string {
 		lipgloss.Top,
 		ui.keycap.Render(":"),
 		" actions ",
+		ui.keycap.Render("M"),
+		" mouse ",
 		ui.keycap.Render("q"),
 		" quit",
 	)
@@ -1167,15 +1239,32 @@ func (m model) moveCursor(delta int) model {
 }
 
 func (m model) scrollByPointer(x, y, delta int) model {
-	if inZone(x, y, m.rightZone) {
+	if inZone(x, y, currentLayout.rightZone) {
+		logMouseEvent("scroll target: right detail pane")
 		return m.scrollDetail(delta)
 	}
+	logMouseEvent("scroll target: left list pane")
 	return m.moveCursor(delta)
+}
+
+func (m model) mouseTarget(x, y int) string {
+	for _, z := range currentLayout.tabZones {
+		if inZone(x, y, z) {
+			return "tab:" + z.ID
+		}
+	}
+	if inZone(x, y, currentLayout.leftZone) {
+		return "left"
+	}
+	if inZone(x, y, currentLayout.rightZone) {
+		return "right"
+	}
+	return "none"
 }
 
 func (m model) scrollDetail(delta int) model {
 	contentHeight := detailContentHeight(m.detailContent())
-	visibleHeight := max(1, m.detailHeight)
+	visibleHeight := max(1, currentLayout.detailHeight)
 	maxScroll := max(0, contentHeight-visibleHeight)
 	next := m.detailScroll[m.activeView] + delta
 	if next < 0 {
@@ -2452,6 +2541,7 @@ func manualKeybindTable(width int) string {
 		{"gg / G", "First / last row"},
 		{"mouse wheel", "Scroll the active pane"},
 		{"left click", "Select a tab or row"},
+		{"M", "Toggle app mouse vs terminal selection"},
 		{"m", "Open member form"},
 		{"e", "Edit selected task or member"},
 		{"t", "Open task form"},
@@ -2889,6 +2979,46 @@ func placeOverlay(base, overlay string, width, height int) string {
 	return strings.Join(baseLines, "\n")
 }
 
+func renderMouseDebugOverlay(base string, width, height int) string {
+	lines := []string{
+		ui.sectionTitle.Render("Mouse Debug"),
+		ui.subtitle.Render(fmt.Sprintf("left  (%d,%d)-(%d,%d)", currentLayout.leftZone.X1, currentLayout.leftZone.Y1, currentLayout.leftZone.X2, currentLayout.leftZone.Y2)),
+		ui.subtitle.Render(fmt.Sprintf("right (%d,%d)-(%d,%d)", currentLayout.rightZone.X1, currentLayout.rightZone.Y1, currentLayout.rightZone.X2, currentLayout.rightZone.Y2)),
+		"",
+		ui.eyebrow.Render("Tabs"),
+	}
+	for _, z := range currentLayout.tabZones {
+		lines = append(lines, fmt.Sprintf("%-9s (%d,%d)-(%d,%d)", z.ID, z.X1, z.Y1, z.X2, z.Y2))
+	}
+	lines = append(lines, "")
+	lines = append(lines, ui.eyebrow.Render("Rows"))
+	maxRows := min(8, len(currentLayout.rowZones))
+	for i := 0; i < maxRows; i++ {
+		z := currentLayout.rowZones[i]
+		lines = append(lines, fmt.Sprintf("%-12s (%d,%d)-(%d,%d)", z.ID, z.X1, z.Y1, z.X2, z.Y2))
+	}
+	if len(currentLayout.rowZones) > maxRows {
+		lines = append(lines, ui.subtitle.Render(fmt.Sprintf("… %d more rows", len(currentLayout.rowZones)-maxRows)))
+	}
+
+	panel := ui.modalFrame.
+		Width(min(48, max(36, width/3))).
+		Render(strings.Join(lines, "\n"))
+	return placeOverlay(base, panel, width, height)
+}
+
+func logMouseEvent(format string, args ...any) {
+	if mouseDebugLogPath == "" {
+		return
+	}
+	f, err := os.OpenFile(mouseDebugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
+}
+
 func gSummary(tasks []task, m model) string {
 	var parts []string
 	for i, t := range tasks {
@@ -2910,6 +3040,14 @@ func plural(n int) string {
 
 func inZone(x, y int, z zone) bool {
 	return x >= z.X1 && x <= z.X2 && y >= z.Y1 && y <= z.Y2
+}
+
+func detectTerminalSize() (int, int, bool) {
+	width, height, err := term.GetSize(os.Stdout.Fd())
+	if err != nil || width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
 }
 
 func min(a, b int) int {
