@@ -956,6 +956,9 @@ func (m model) renderDetail(width, height int) string {
 	innerWidth := max(1, width-4)
 
 	content := m.detailContent()
+	if m.activeView == viewHelp {
+		content = helpManual(innerWidth)
+	}
 	content = lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
 	content = renderViewport(content, innerWidth, max(1, height-4), m.detailScroll[m.activeView])
 	return box.Render(content)
@@ -972,7 +975,7 @@ func (m model) detailContent() string {
 	case viewDates:
 		return m.dateDetail()
 	case viewHelp:
-		return helpManual()
+		return ""
 	default:
 		return ""
 	}
@@ -2403,12 +2406,12 @@ due:next friday
 `)
 }
 
-func helpManual() string {
+func helpManual(width int) string {
 	return strings.Join([]string{
 		"Manual",
 		"",
 		"Keybinds",
-		manualKeybindTable(),
+		manualKeybindTable(width),
 		"",
 		"Quick Note Capture",
 		"Use the top fields to scope the batch, then write plain task lines below.",
@@ -2439,7 +2442,7 @@ func helpManual() string {
 	}, "\n")
 }
 
-func manualKeybindTable() string {
+func manualKeybindTable(width int) string {
 	rows := [][2]string{
 		{"1 / 2 / 3 / 4 / 5", "Jump to Tasks, Team, Timeline, Archive, Help"},
 		{":", "Open action palette"},
@@ -2477,6 +2480,17 @@ func manualKeybindTable() string {
 		if len(row[1]) > actionWidth {
 			actionWidth = len(row[1])
 		}
+	}
+
+	fullWidth := keyWidth + actionWidth + 7
+	if width > 0 && fullWidth > width {
+		lines := make([]string, 0, len(rows)*3)
+		for _, row := range rows {
+			lines = append(lines, ui.inputLabel.Render(row[0]))
+			lines = append(lines, "  "+row[1])
+			lines = append(lines, "")
+		}
+		return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 	}
 
 	top := "┌" + strings.Repeat("─", keyWidth+2) + "┬" + strings.Repeat("─", actionWidth+2) + "┐"
