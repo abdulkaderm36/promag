@@ -411,26 +411,17 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		logMouseEvent("mouse ignored: mouse disabled")
 		return m, nil
 	}
-	if msg.Action != tea.MouseActionPress {
-		if msg.Button == tea.MouseButtonWheelUp {
-			logMouseEvent("mouse scroll: direction=up target=%s", m.mouseTarget(msg.X, msg.Y))
-			return m.scrollByPointer(msg.X, msg.Y, -1), nil
-		}
-		if msg.Button == tea.MouseButtonWheelDown {
-			logMouseEvent("mouse scroll: direction=down target=%s", m.mouseTarget(msg.X, msg.Y))
-			return m.scrollByPointer(msg.X, msg.Y, 1), nil
-		}
-		logMouseEvent("mouse ignored: non-press action without wheel")
-		return m, nil
-	}
-
 	if msg.Button == tea.MouseButtonWheelUp {
-		logMouseEvent("mouse scroll press: direction=up target=%s", m.mouseTarget(msg.X, msg.Y))
+		logMouseEvent("mouse wheel: direction=up target=%s action=%v", m.mouseTarget(msg.X, msg.Y), msg.Action)
 		return m.scrollByPointer(msg.X, msg.Y, -1), nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
-		logMouseEvent("mouse scroll press: direction=down target=%s", m.mouseTarget(msg.X, msg.Y))
+		logMouseEvent("mouse wheel: direction=down target=%s action=%v", m.mouseTarget(msg.X, msg.Y), msg.Action)
 		return m.scrollByPointer(msg.X, msg.Y, 1), nil
+	}
+	if msg.Action != tea.MouseActionPress {
+		logMouseEvent("mouse ignored: non-press action without wheel")
+		return m, nil
 	}
 	if msg.Button != tea.MouseButtonLeft || m.overlay != overlayNone {
 		logMouseEvent("mouse ignored: button=%v overlay=%s", msg.Button, m.overlay)
@@ -948,7 +939,7 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 		return box.Render(strings.Join(lines, "\n"))
 	}
 
-	innerHeight := max(1, height-4)
+	innerHeight := max(1, height-4-len(lines))
 	rowHeight := 2
 	if m.activeView == viewTasks {
 		rowHeight = 3
@@ -1263,7 +1254,7 @@ func (m model) mouseTarget(x, y int) string {
 }
 
 func (m model) scrollDetail(delta int) model {
-	contentHeight := detailContentHeight(m.detailContent())
+	contentHeight := detailContentHeight(m.detailViewportContent())
 	visibleHeight := max(1, currentLayout.detailHeight)
 	maxScroll := max(0, contentHeight-visibleHeight)
 	next := m.detailScroll[m.activeView] + delta
@@ -1275,6 +1266,39 @@ func (m model) scrollDetail(delta int) model {
 	}
 	m.detailScroll[m.activeView] = next
 	return m
+}
+
+func (m model) detailViewportContent() string {
+	innerWidth := max(1, m.detailInnerWidth())
+	content := m.detailContent()
+	if m.activeView == viewHelp {
+		content = helpManual(innerWidth)
+	}
+	return lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
+}
+
+func (m model) detailInnerWidth() int {
+	availableWidth := max(60, m.width)
+	gapWidth := 1
+	leftWidth := max(minLeftWidth, min(availableWidth/2-1, 48))
+	if leftWidth > availableWidth-32 {
+		leftWidth = max(28, availableWidth/2)
+	}
+	rightWidth := max(30, availableWidth-leftWidth-gapWidth)
+
+	leftRenderedWidth := ui.panelFrame.Width(leftWidth).Height(max(8, m.bodyHeight)).GetWidth()
+	rightRenderedWidth := ui.panelFrameAlt.Width(rightWidth).Height(max(8, m.bodyHeight)).GetWidth()
+	totalWidth := leftRenderedWidth + gapWidth + rightRenderedWidth
+	if overflow := totalWidth - m.width; overflow > 0 {
+		rightWidth = max(30, rightWidth-overflow)
+		rightRenderedWidth = ui.panelFrameAlt.Width(rightWidth).Height(max(8, m.bodyHeight)).GetWidth()
+		totalWidth = leftRenderedWidth + gapWidth + rightRenderedWidth
+	}
+	if overflow := totalWidth - m.width; overflow > 0 {
+		leftWidth = max(28, leftWidth-overflow)
+		_ = ui.panelFrame.Width(leftWidth).Height(max(8, m.bodyHeight)).GetWidth()
+	}
+	return max(1, rightWidth-4)
 }
 
 func (m *model) nextView() {
