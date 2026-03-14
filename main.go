@@ -106,6 +106,7 @@ type layoutState struct {
 	bodyTop      int
 	bodyHeight   int
 	detailHeight int
+	detailWidth  int
 }
 
 type model struct {
@@ -1015,6 +1016,7 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 func (m model) renderDetail(width, height int) string {
 	box := ui.panelFrameAlt.Width(width).Height(height)
 	innerWidth := max(1, width-4)
+	currentLayout.detailWidth = innerWidth
 
 	content := m.detailContent()
 	if m.activeView == viewHelp {
@@ -1269,36 +1271,12 @@ func (m model) scrollDetail(delta int) model {
 }
 
 func (m model) detailViewportContent() string {
-	innerWidth := max(1, m.detailInnerWidth())
+	innerWidth := max(1, currentLayout.detailWidth)
 	content := m.detailContent()
 	if m.activeView == viewHelp {
 		content = helpManual(innerWidth)
 	}
 	return lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
-}
-
-func (m model) detailInnerWidth() int {
-	availableWidth := max(60, m.width)
-	gapWidth := 1
-	leftWidth := max(minLeftWidth, min(availableWidth/2-1, 48))
-	if leftWidth > availableWidth-32 {
-		leftWidth = max(28, availableWidth/2)
-	}
-	rightWidth := max(30, availableWidth-leftWidth-gapWidth)
-
-	leftRenderedWidth := ui.panelFrame.Width(leftWidth).Height(max(8, m.bodyHeight)).GetWidth()
-	rightRenderedWidth := ui.panelFrameAlt.Width(rightWidth).Height(max(8, m.bodyHeight)).GetWidth()
-	totalWidth := leftRenderedWidth + gapWidth + rightRenderedWidth
-	if overflow := totalWidth - m.width; overflow > 0 {
-		rightWidth = max(30, rightWidth-overflow)
-		rightRenderedWidth = ui.panelFrameAlt.Width(rightWidth).Height(max(8, m.bodyHeight)).GetWidth()
-		totalWidth = leftRenderedWidth + gapWidth + rightRenderedWidth
-	}
-	if overflow := totalWidth - m.width; overflow > 0 {
-		leftWidth = max(28, leftWidth-overflow)
-		_ = ui.panelFrame.Width(leftWidth).Height(max(8, m.bodyHeight)).GetWidth()
-	}
-	return max(1, rightWidth-4)
 }
 
 func (m *model) nextView() {
@@ -2977,7 +2955,7 @@ func detailContentHeight(content string) int {
 	if content == "" {
 		return 1
 	}
-	return len(strings.Split(content, "\n"))
+	return max(1, lipgloss.Height(content))
 }
 
 func placeOverlay(base, overlay string, width, height int) string {
