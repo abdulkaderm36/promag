@@ -113,6 +113,9 @@ type model struct {
 
 	overlay overlayMode
 
+	editingTaskID   string
+	editingMemberID string
+
 	memberInputs []textinput.Model
 	taskInputs   []textinput.Model
 	filterInputs []textinput.Model
@@ -500,6 +503,8 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		m.openMemberForm()
 		return m, nil
+	case "e":
+		return m.editSelected(), nil
 	case "t":
 		m.openTaskForm(m.taskFormPrefill())
 		return m, nil
@@ -537,7 +542,11 @@ func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.setStatus(err.Error())
 				return m, nil
 			}
-			m.closeOverlay("Member saved.")
+			status := "Member saved."
+			if m.editingMemberID != "" {
+				status = "Member updated."
+			}
+			m.closeOverlay(status)
 			return m, nil
 		}
 		m.navigateForm(len(m.memberInputs), s)
@@ -547,7 +556,11 @@ func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setStatus(err.Error())
 			return m, nil
 		}
-		m.closeOverlay("Member saved.")
+		status := "Member saved."
+		if m.editingMemberID != "" {
+			status = "Member updated."
+		}
+		m.closeOverlay(status)
 		return m, nil
 	}
 
@@ -575,14 +588,22 @@ func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setStatus(err.Error())
 			return m, nil
 		}
-		m.closeOverlay("Task saved.")
+		status := "Task saved."
+		if m.editingTaskID != "" {
+			status = "Task updated."
+		}
+		m.closeOverlay(status)
 		return m, nil
 	case "ctrl+s":
 		if err := m.submitTaskForm(); err != nil {
 			m.setStatus(err.Error())
 			return m, nil
 		}
-		m.closeOverlay("Task saved.")
+		status := "Task saved."
+		if m.editingTaskID != "" {
+			status = "Task updated."
+		}
+		m.closeOverlay(status)
 		return m, nil
 	}
 
@@ -698,6 +719,9 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.closeOverlay("")
 		m.openMemberForm()
 		return m, nil
+	case "e":
+		m.closeOverlay("")
+		return m.editSelected(), nil
 	case "t":
 		m.closeOverlay("")
 		m.openTaskForm(m.taskFormPrefill())
@@ -710,6 +734,9 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.closeOverlay("")
 		m.openFilterForm()
 		return m, nil
+	case "x":
+		m.closeOverlay("")
+		return m.deleteSelected(), nil
 	}
 	return m, nil
 }
@@ -963,9 +990,11 @@ func (m model) renderOverlay() string {
 			ui.subtitle.Render("Press a key to open the matching modal. esc cancels."),
 			"",
 			"  t   Add Task",
+			"  e   Edit Selected",
 			"  m   Add Team Member",
 			"  n   Quick Note Capture",
 			"  f   Filters",
+			"  x   Delete Selected",
 			"  ?   Manual",
 			"  q   Quit",
 			"",
@@ -1146,6 +1175,8 @@ func (m *model) setStatus(s string) {
 func (m *model) closeOverlay(status string) {
 	m.overlay = overlayNone
 	m.formCursor = 0
+	m.editingTaskID = ""
+	m.editingMemberID = ""
 	for i := range m.memberInputs {
 		m.memberInputs[i].Blur()
 	}
@@ -1167,6 +1198,7 @@ func (m *model) closeOverlay(status string) {
 func (m *model) openMemberForm() {
 	m.overlay = overlayMember
 	m.formCursor = 0
+	m.editingMemberID = ""
 	for i := range m.memberInputs {
 		m.memberInputs[i].SetValue("")
 		m.memberInputs[i].Blur()
@@ -1177,6 +1209,7 @@ func (m *model) openMemberForm() {
 func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 	m.overlay = overlayTask
 	m.formCursor = 0
+	m.editingTaskID = ""
 	for i := range m.taskInputs {
 		m.taskInputs[i].SetValue("")
 		m.taskInputs[i].Blur()
@@ -1217,6 +1250,45 @@ func (m *model) openFilterForm() {
 	}
 	m.refreshMemberSuggestions()
 	m.filterInputs[0].Focus()
+}
+
+func (m *model) openMemberEditForm(selected *member) {
+	if selected == nil {
+		return
+	}
+	m.overlay = overlayMember
+	m.formCursor = 0
+	m.editingMemberID = selected.ID
+	for i := range m.memberInputs {
+		m.memberInputs[i].SetValue("")
+		m.memberInputs[i].Blur()
+	}
+	m.memberInputs[0].SetValue(selected.Name)
+	m.memberInputs[1].SetValue(selected.Role)
+	m.memberInputs[2].SetValue(selected.Email)
+	m.memberInputs[0].Focus()
+}
+
+func (m *model) openTaskEditForm(selected *task) {
+	if selected == nil {
+		return
+	}
+	m.overlay = overlayTask
+	m.formCursor = 0
+	m.editingTaskID = selected.ID
+	for i := range m.taskInputs {
+		m.taskInputs[i].SetValue("")
+		m.taskInputs[i].Blur()
+	}
+	m.taskInputs[0].SetValue(selected.Title)
+	m.taskInputs[1].SetValue(m.memberName(selected.MemberID))
+	m.taskInputs[2].SetValue(selected.Category)
+	m.taskInputs[3].SetValue(selected.Priority)
+	m.taskInputs[4].SetValue(strings.Join(selected.Tags, ","))
+	m.taskInputs[5].SetValue(selected.DueDate)
+	m.taskInputs[6].SetValue(strings.Join(selected.Comments, " | "))
+	m.refreshMemberSuggestions()
+	m.taskInputs[0].Focus()
 }
 
 func (m *model) openActionMenu() {
@@ -1285,8 +1357,22 @@ func (m *model) submitMemberForm() error {
 	if name == "" {
 		return errors.New("member name is required")
 	}
-	if m.findMemberByName(name) != nil {
+	existing := m.findMemberByName(name)
+	if existing != nil && existing.ID != m.editingMemberID {
 		return fmt.Errorf("member %q already exists", name)
+	}
+	if m.editingMemberID != "" {
+		for i := range m.state.Members {
+			if m.state.Members[i].ID != m.editingMemberID {
+				continue
+			}
+			m.state.Members[i].Name = name
+			m.state.Members[i].Role = role
+			m.state.Members[i].Email = email
+			m.refreshMemberSuggestions()
+			return saveState(m.dataPath, m.state)
+		}
+		return errors.New("member to edit was not found")
 	}
 	m.state.Members = append(m.state.Members, member{
 		ID:    nextID("mem", time.Now()),
@@ -1323,6 +1409,33 @@ func (m *model) submitTaskForm() error {
 	}
 	if len(memberIDs) == 0 {
 		memberIDs = []string{""}
+	}
+	if m.editingTaskID != "" {
+		if len(memberIDs) > 1 {
+			return errors.New("editing a task supports at most one member")
+		}
+		for i := range m.state.Tasks {
+			if m.state.Tasks[i].ID != m.editingTaskID {
+				continue
+			}
+			memberID := ""
+			if len(memberIDs) == 1 {
+				memberID = memberIDs[0]
+			}
+			m.state.Tasks[i].Title = title
+			m.state.Tasks[i].MemberID = memberID
+			m.state.Tasks[i].Category = category
+			m.state.Tasks[i].Priority = priority
+			m.state.Tasks[i].Tags = tags
+			m.state.Tasks[i].Comments = comments
+			m.state.Tasks[i].DueDate = dueDate
+			if err := saveState(m.dataPath, m.state); err != nil {
+				return err
+			}
+			m.activeView = viewTasks
+			return nil
+		}
+		return errors.New("task to edit was not found")
 	}
 
 	for _, memberID := range memberIDs {
@@ -1412,6 +1525,30 @@ func (m *model) clearFilters() {
 		m.filterInputs[i].SetValue("")
 	}
 	m.setStatus("Filters cleared.")
+}
+
+func (m model) editSelected() model {
+	switch m.activeView {
+	case viewTasks:
+		selected := m.selectedTask()
+		if selected == nil {
+			m.setStatus("No task selected.")
+			return m
+		}
+		m.openTaskEditForm(selected)
+		m.setStatus("Editing task.")
+	case viewMembers:
+		selected := m.selectedMember()
+		if selected == nil {
+			m.setStatus("No member selected.")
+			return m
+		}
+		m.openMemberEditForm(selected)
+		m.setStatus("Editing member.")
+	default:
+		m.setStatus("Edit is available in Task and Team views.")
+	}
+	return m
 }
 
 func (m model) toggleSelectedTask() model {
@@ -2177,6 +2314,7 @@ func manualKeybindTable() string {
 		{"mouse wheel", "Scroll the active pane"},
 		{"left click", "Select a tab or row"},
 		{"m", "Open member form"},
+		{"e", "Edit selected task or member"},
 		{"t", "Open task form"},
 		{"a", "Context-aware add action"},
 		{"f or /", "Open filters"},
