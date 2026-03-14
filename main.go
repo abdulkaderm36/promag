@@ -86,6 +86,8 @@ type appState struct {
 type row struct {
 	Title    string
 	Subtitle string
+	Meta     string
+	Right    string
 	ID       string
 }
 
@@ -193,10 +195,7 @@ func newTheme() theme {
 		rowSelected: lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#F8FBFF")).
-			BorderLeft(true).
-			BorderStyle(lipgloss.ThickBorder()).
-			BorderForeground(lipgloss.Color("#7FDBB6")).
-			Padding(0, 1),
+			Padding(0, 2),
 		rowIdle: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#D9E6F3")).
 			Padding(0, 2),
@@ -842,7 +841,12 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 	}
 
 	innerHeight := max(1, height-4)
-	maxRows := max(1, innerHeight/2)
+	rowHeight := 2
+	if m.activeView == viewTasks {
+		rowHeight = 3
+	}
+	rowHeight++
+	maxRows := max(1, innerHeight/rowHeight)
 	offset := 0
 	if selected >= maxRows {
 		offset = selected - maxRows + 1
@@ -850,18 +854,54 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 
 	for idx := offset; idx < len(rows) && idx < offset+maxRows; idx++ {
 		r := rows[idx]
-		lead := ui.metricLabel.Render(fmt.Sprintf("%02d", idx+1))
-		headline := lipgloss.JoinHorizontal(lipgloss.Center, lead, " ", truncate(r.Title, width-12))
-		subtitle := ui.subtitle.Render("   " + truncate(r.Subtitle, width-7))
-		if idx == selected {
-			lines = append(lines, ui.rowSelected.Width(width-6).Render(headline))
-			lines = append(lines, subtitle)
-		} else {
-			lines = append(lines, ui.rowIdle.Width(width-6).Render(headline))
-			lines = append(lines, subtitle)
+		rowWidth := width - 6
+		indicatorWidth := 1
+		cardWidth := max(8, rowWidth-indicatorWidth)
+		selectedRow := idx == selected
+		rowStyle := ui.rowIdle
+		if selectedRow {
+			rowStyle = ui.rowSelected
 		}
-		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + 1, ID: r.ID})
-		y += 2
+		rowContentWidth := cardWidth - rowStyle.GetHorizontalFrameSize()
+		rowContentWidth = max(8, rowContentWidth)
+		lead := ui.metricLabel.Render(fmt.Sprintf("%02d", idx+1))
+		titleWidth := max(8, rowContentWidth-lipgloss.Width(lead)-1)
+		headline := lipgloss.JoinHorizontal(lipgloss.Center, lead, " ", truncate(r.Title, titleWidth))
+		if r.Right != "" {
+			leftWidth := max(10, rowContentWidth-lipgloss.Width(r.Right)-lipgloss.Width(lead)-1)
+			headline = joinHeaderLine(
+				lipgloss.JoinHorizontal(lipgloss.Center, lead, " ", truncate(r.Title, leftWidth)),
+				r.Right,
+				rowContentWidth,
+			)
+		}
+		cardLines := []string{
+			headline,
+			ui.subtitle.Render(truncate(r.Subtitle, rowContentWidth)),
+		}
+		if r.Meta != "" {
+			cardLines = append(cardLines, truncate(r.Meta, rowContentWidth))
+		}
+		indicator := strings.Repeat(" ", indicatorWidth)
+		if selectedRow {
+			indicator = lipgloss.NewStyle().Width(indicatorWidth).Foreground(ui.accent).Render("│")
+		}
+		for _, line := range cardLines {
+			lines = append(lines, indicator+rowStyle.Width(cardWidth).Render(line))
+		}
+		divider := lipgloss.NewStyle().
+			Width(cardWidth).
+			Padding(0, 2).
+			Foreground(ui.borderStrong).
+			Render(strings.Repeat("─", max(1, cardWidth-4)))
+		lines = append(lines, strings.Repeat(" ", indicatorWidth)+divider)
+		rowSpan := 2
+		if r.Meta != "" {
+			rowSpan = 3
+		}
+		rowSpan++
+		m.rowZones = append(m.rowZones, zone{X1: 0, Y1: y, X2: width - 1, Y2: y + rowSpan - 1, ID: r.ID})
+		y += rowSpan
 	}
 
 	return box.Render(strings.Join(lines, "\n"))
@@ -869,9 +909,11 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 
 func (m model) renderDetail(width, height int) string {
 	box := ui.panelFrameAlt.Width(width).Height(height)
+	innerWidth := max(1, width-4)
 
 	content := m.detailContent()
-	content = renderViewport(content, max(1, width-4), max(1, height-4), m.detailScroll[m.activeView])
+	content = lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
+	content = renderViewport(content, innerWidth, max(1, height-4), m.detailScroll[m.activeView])
 	return box.Render(content)
 }
 
@@ -994,8 +1036,9 @@ func (m model) rowsForView() []row {
 			memberName := m.memberName(t.MemberID)
 			rows = append(rows, row{
 				ID:       t.ID,
-				Title:    fmt.Sprintf("%s  %s  %s", statusChip(t.Status), truncate(t.Title, 26), priorityChip(t.Priority)),
-				Subtitle: fmt.Sprintf("%s  •  %s  •  %s", fallback(memberName, "Unassigned"), fallback(t.Category, "no category"), dueLabel(t.DueDate)),
+				Title:    t.Title,
+				Subtitle: fmt.Sprintf("%s  •  %s", fallback(memberName, "Unassigned"), dueLabel(t.DueDate)),
+				Meta:     lipgloss.JoinHorizontal(lipgloss.Top, statusPill(t.Status), ui.subtitle.Render(" • "), priorityPill(t.Priority)),
 			})
 		}
 		return rows
@@ -2366,6 +2409,19 @@ func statusChip(status string) string {
 	}
 }
 
+func statusPill(status string) string {
+	label := fallback(strings.ToLower(strings.TrimSpace(status)), "open")
+	style := lipgloss.NewStyle().
+		Bold(true).
+		Padding(0, 1)
+	switch label {
+	case "done":
+		return style.Foreground(ui.success).Render("done")
+	default:
+		return style.Foreground(ui.warn).Render("open")
+	}
+}
+
 func priorityChip(priority string) string {
 	style := lipgloss.NewStyle().Bold(true)
 	switch normalizePriority(priority) {
@@ -2380,6 +2436,35 @@ func priorityChip(priority string) string {
 	default:
 		return style.Foreground(lipgloss.Color("#AEB7C4")).Render(fallback(priority, "none"))
 	}
+}
+
+func priorityIcon(priority string) string {
+	style := lipgloss.NewStyle().Bold(true)
+	switch normalizePriority(priority) {
+	case "urgent":
+		return style.Foreground(lipgloss.Color("#F28B82")).Render("◆")
+	case "high":
+		return style.Foreground(lipgloss.Color("#F6C177")).Render("▲")
+	case "medium":
+		return style.Foreground(lipgloss.Color("#8FB8DE")).Render("●")
+	case "low":
+		return style.Foreground(lipgloss.Color("#7CC5A1")).Render("•")
+	default:
+		return style.Foreground(lipgloss.Color("#AEB7C4")).Render("•")
+	}
+}
+
+func priorityPill(priority string) string {
+	label := normalizePriority(priority)
+	if label == "" {
+		label = "none"
+	}
+	icon := priorityIcon(label)
+	style := lipgloss.NewStyle().
+		Bold(true).
+		Padding(0, 1).
+		Foreground(ui.text)
+	return style.Render(lipgloss.JoinHorizontal(lipgloss.Center, icon, " ", label))
 }
 
 func memberBadge(name string) string {
@@ -2418,17 +2503,10 @@ func fallback(value, alt string) string {
 }
 
 func truncate(value string, width int) string {
-	if lipgloss.Width(value) <= width {
-		return value
+	if width <= 0 {
+		return ""
 	}
-	if width <= 1 {
-		return value[:width]
-	}
-	runes := []rune(value)
-	if len(runes) > width-1 {
-		return string(runes[:width-1]) + "…"
-	}
-	return value
+	return ansi.Truncate(value, width, "…")
 }
 
 func joinHeaderLine(left, right string, width int) string {
