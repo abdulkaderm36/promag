@@ -36,6 +36,7 @@ const (
 	viewTasks   viewMode = "tasks"
 	viewMembers viewMode = "members"
 	viewDates   viewMode = "dates"
+	viewArchive viewMode = "archive"
 	viewHelp    viewMode = "help"
 )
 
@@ -75,6 +76,7 @@ type task struct {
 	Comments  []string  `json:"comments"`
 	DueDate   string    `json:"due_date"`
 	Status    string    `json:"status"`
+	Archived  bool      `json:"archived"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -329,7 +331,7 @@ func newModel(path string, state appState) model {
 		dataPath:     path,
 		state:        state,
 		activeView:   viewTasks,
-		cursor:       map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewHelp: 0},
+		cursor:       map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 		memberInputs: memberInputs,
 		taskInputs:   taskInputs,
 		filterInputs: filterInputs,
@@ -337,7 +339,7 @@ func newModel(path string, state appState) model {
 		noteInput:    noteInput,
 		lastStatus:   "Ready. Press ? for the full manual.",
 		statusAt:     time.Now(),
-		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewHelp: 0},
+		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 	}
 	model.refreshMemberSuggestions()
 	return model
@@ -449,6 +451,9 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.activeView = viewDates
 		return m, nil
 	case "4":
+		m.activeView = viewArchive
+		return m, nil
+	case "5":
 		m.activeView = viewHelp
 		return m, nil
 	case "tab", "l", "right":
@@ -524,6 +529,10 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "x":
 		return m.deleteSelected(), nil
+	case "z":
+		return m.archiveSelectedTask(), nil
+	case "r":
+		return m.restoreSelectedTask(), nil
 	}
 
 	m.pendingG = false
@@ -734,6 +743,12 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.closeOverlay("")
 		m.openFilterForm()
 		return m, nil
+	case "z":
+		m.closeOverlay("")
+		return m.archiveSelectedTask(), nil
+	case "r":
+		m.closeOverlay("")
+		return m.restoreSelectedTask(), nil
 	case "x":
 		m.closeOverlay("")
 		return m.deleteSelected(), nil
@@ -768,12 +783,13 @@ func (m model) View() string {
 func (m model) renderHeader() string {
 	frameWidth := max(20, m.width)
 	contentWidth := max(20, frameWidth-ui.headerFrame.GetHorizontalFrameSize())
-	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewArchive, viewHelp}
 	labels := map[viewMode]string{
 		viewTasks:   "1 Tasks",
 		viewMembers: "2 Team",
 		viewDates:   "3 Timeline",
-		viewHelp:    "4 Guide",
+		viewArchive: "4 Archive",
+		viewHelp:    "5 Guide",
 	}
 
 	logo := m.renderLogo(contentWidth)
@@ -851,6 +867,7 @@ func (m model) renderList(rows []row, width, height, selected int) string {
 		viewTasks:   "Task Queue",
 		viewMembers: "Team Directory",
 		viewDates:   "Due Timeline",
+		viewArchive: "Archived Tasks",
 		viewHelp:    "Manual",
 	}[m.activeView]
 
@@ -948,6 +965,8 @@ func (m model) detailContent() string {
 	switch m.activeView {
 	case viewTasks:
 		return m.taskDetail()
+	case viewArchive:
+		return m.taskDetail()
 	case viewMembers:
 		return m.memberDetail()
 	case viewDates:
@@ -994,6 +1013,8 @@ func (m model) renderOverlay() string {
 			"  m   Add Team Member",
 			"  n   Quick Note Capture",
 			"  f   Filters",
+			"  z   Archive Completed Task",
+			"  r   Restore Archived Task",
 			"  x   Delete Selected",
 			"  ?   Manual",
 			"  q   Quit",
@@ -1068,6 +1089,19 @@ func (m model) rowsForView() []row {
 				Title:    t.Title,
 				Subtitle: fmt.Sprintf("%s  •  %s", fallback(memberName, "Unassigned"), dueLabel(t.DueDate)),
 				Meta:     lipgloss.JoinHorizontal(lipgloss.Top, statusPill(t.Status), ui.subtitle.Render(" • "), priorityPill(t.Priority)),
+			})
+		}
+		return rows
+	case viewArchive:
+		tasks := m.archivedTasks()
+		rows := make([]row, 0, len(tasks))
+		for _, t := range tasks {
+			memberName := m.memberName(t.MemberID)
+			rows = append(rows, row{
+				ID:       t.ID,
+				Title:    t.Title,
+				Subtitle: fmt.Sprintf("%s  •  %s", fallback(memberName, "Unassigned"), dueLabel(t.DueDate)),
+				Meta:     lipgloss.JoinHorizontal(lipgloss.Top, statusPill("archived"), ui.subtitle.Render(" • "), priorityPill(t.Priority)),
 			})
 		}
 		return rows
@@ -1152,13 +1186,13 @@ func (m model) scrollDetail(delta int) model {
 }
 
 func (m *model) nextView() {
-	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewArchive, viewHelp}
 	idx := slices.Index(views, m.activeView)
 	m.activeView = views[(idx+1)%len(views)]
 }
 
 func (m *model) prevView() {
-	views := []viewMode{viewTasks, viewMembers, viewDates, viewHelp}
+	views := []viewMode{viewTasks, viewMembers, viewDates, viewArchive, viewHelp}
 	idx := slices.Index(views, m.activeView)
 	if idx <= 0 {
 		m.activeView = views[len(views)-1]
@@ -1513,7 +1547,7 @@ func (m *model) submitFilterForm() error {
 		Member: strings.TrimSpace(m.filterInputs[1].Value()),
 		Due:    due,
 	}
-	for _, view := range []viewMode{viewTasks, viewMembers, viewDates} {
+	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive} {
 		m.cursor[view] = 0
 	}
 	return nil
@@ -1545,6 +1579,8 @@ func (m model) editSelected() model {
 		}
 		m.openMemberEditForm(selected)
 		m.setStatus("Editing member.")
+	case viewArchive:
+		m.setStatus("Archived tasks can only be restored or deleted.")
 	default:
 		m.setStatus("Edit is available in Task and Team views.")
 	}
@@ -1552,6 +1588,10 @@ func (m model) editSelected() model {
 }
 
 func (m model) toggleSelectedTask() model {
+	if m.activeView != viewTasks {
+		m.setStatus("Done toggle is only available in Task view.")
+		return m
+	}
 	selected := m.selectedTask()
 	if selected == nil {
 		m.setStatus("No task selected.")
@@ -1576,6 +1616,62 @@ func (m model) toggleSelectedTask() model {
 	return m
 }
 
+func (m model) archiveSelectedTask() model {
+	if m.activeView != viewTasks {
+		m.setStatus("Archive is only available in Task view.")
+		return m
+	}
+	selected := m.selectedTask()
+	if selected == nil {
+		m.setStatus("No task selected.")
+		return m
+	}
+	if selected.Status != "done" {
+		m.setStatus("Only completed tasks can be archived.")
+		return m
+	}
+	for i := range m.state.Tasks {
+		if m.state.Tasks[i].ID != selected.ID {
+			continue
+		}
+		m.state.Tasks[i].Archived = true
+		break
+	}
+	if err := saveState(m.dataPath, m.state); err != nil {
+		m.setStatus("save failed: " + err.Error())
+		return m
+	}
+	m.setStatus("Task archived.")
+	m.clampCursor(len(m.filteredTasks()))
+	return m
+}
+
+func (m model) restoreSelectedTask() model {
+	if m.activeView != viewArchive {
+		m.setStatus("Restore is only available in Archive view.")
+		return m
+	}
+	selected := m.selectedTask()
+	if selected == nil {
+		m.setStatus("No archived task selected.")
+		return m
+	}
+	for i := range m.state.Tasks {
+		if m.state.Tasks[i].ID != selected.ID {
+			continue
+		}
+		m.state.Tasks[i].Archived = false
+		break
+	}
+	if err := saveState(m.dataPath, m.state); err != nil {
+		m.setStatus("save failed: " + err.Error())
+		return m
+	}
+	m.setStatus("Task restored.")
+	m.clampCursor(len(m.archivedTasks()))
+	return m
+}
+
 func (m model) deleteSelected() model {
 	switch m.activeView {
 	case viewTasks:
@@ -1590,6 +1686,18 @@ func (m model) deleteSelected() model {
 			return m
 		}
 		m.setStatus("Task deleted.")
+	case viewArchive:
+		selected := m.selectedTask()
+		if selected == nil {
+			m.setStatus("No archived task selected.")
+			return m
+		}
+		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
+		if err := saveState(m.dataPath, m.state); err != nil {
+			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		m.setStatus("Archived task deleted.")
 	case viewMembers:
 		selected := m.selectedMember()
 		if selected == nil {
@@ -1617,14 +1725,19 @@ func (m model) deleteSelected() model {
 }
 
 func (m model) selectedTask() *task {
-	if m.activeView != viewTasks {
+	if m.activeView != viewTasks && m.activeView != viewArchive {
 		return nil
 	}
 	tasks := m.filteredTasks()
+	cursorView := viewTasks
+	if m.activeView == viewArchive {
+		tasks = m.archivedTasks()
+		cursorView = viewArchive
+	}
 	if len(tasks) == 0 {
 		return nil
 	}
-	idx := min(max(m.cursor[viewTasks], 0), len(tasks)-1)
+	idx := min(max(m.cursor[cursorView], 0), len(tasks)-1)
 	return &tasks[idx]
 }
 
@@ -1658,6 +1771,9 @@ func (m model) selectedDateGroup() *dateGroup {
 func (m model) taskDetail() string {
 	selected := m.selectedTask()
 	if selected == nil {
+		if m.activeView == viewArchive {
+			return ui.sectionTitle.Render("Archived Task Details") + "\n" + ui.subtitle.Render("Restore with r or delete with x.")
+		}
 		return ui.sectionTitle.Render("Task Details") + "\n" + ui.subtitle.Render("Create a task with t or quick capture with n.")
 	}
 
@@ -1676,6 +1792,7 @@ func (m model) taskDetail() string {
 		ui.sectionTitle.Render(selected.Title),
 		ui.subtitle.Render(strings.ToUpper(fallback(selected.Category, "uncategorized"))),
 		"",
+		m.detailPair("State", archiveLabel(selected.Archived)),
 		m.detailPair("Status", statusChip(selected.Status)),
 		m.detailPair("Member", memberBadge(memberName)+"  "+memberName),
 		m.detailPair("Priority", priorityChip(selected.Priority)),
@@ -1754,11 +1871,13 @@ func (m model) dateDetail() string {
 func (m model) listHint() string {
 	switch m.activeView {
 	case viewTasks:
-		return "j/k move • space mark done • t add task • n quick notes • f filter"
+		return "j/k move • space mark done • z archive done task • t add task • n quick notes • f filter"
 	case viewMembers:
 		return "j/k move • m add member • t add task for selected member • f filter"
 	case viewDates:
 		return "j/k move • grouped by due date • full tasks on right • f filter"
+	case viewArchive:
+		return "j/k move • r restore • x delete permanently"
 	case viewHelp:
 		return "Full manual on the right pane"
 	default:
@@ -1888,6 +2007,9 @@ func (m model) tasksForMember(memberID string) []task {
 
 func (m model) memberTaskCounts(memberID string) (open int, done int) {
 	for _, t := range m.state.Tasks {
+		if t.Archived {
+			continue
+		}
 		if t.MemberID != memberID {
 			continue
 		}
@@ -1936,6 +2058,18 @@ func (m model) sortedTasks() []task {
 	return tasks
 }
 
+func (m model) archivedTasks() []task {
+	tasks := slices.DeleteFunc(m.sortedTasks(), func(t task) bool {
+		return !t.Archived
+	})
+	if m.filter == (filterState{}) {
+		return tasks
+	}
+	return slices.DeleteFunc(tasks, func(t task) bool {
+		return !m.matchesTaskFilters(t)
+	})
+}
+
 type dateGroup struct {
 	Date  string
 	Tasks []task
@@ -1960,7 +2094,9 @@ func (m model) groupedDates() []dateGroup {
 }
 
 func (m model) filteredTasks() []task {
-	tasks := m.sortedTasks()
+	tasks := slices.DeleteFunc(m.sortedTasks(), func(t task) bool {
+		return t.Archived
+	})
 	if m.filter == (filterState{}) {
 		return tasks
 	}
@@ -2305,7 +2441,7 @@ func helpManual() string {
 
 func manualKeybindTable() string {
 	rows := [][2]string{
-		{"1 / 2 / 3 / 4", "Jump to Tasks, Team, Timeline, Help"},
+		{"1 / 2 / 3 / 4 / 5", "Jump to Tasks, Team, Timeline, Archive, Help"},
 		{":", "Open action palette"},
 		{"tab / shift+tab", "Cycle views"},
 		{"h / l", "Previous / next view"},
@@ -2324,7 +2460,9 @@ func manualKeybindTable() string {
 		{"ctrl+s", "Save task, member, note, or filters"},
 		{"up/down, ctrl+j/k", "Move between form fields"},
 		{"space", "Toggle done in Task View"},
-		{"x", "Delete selected task or empty member"},
+		{"z", "Archive completed task in Task View"},
+		{"r", "Restore task in Archive view"},
+		{"x", "Delete selected task, archived task, or empty member"},
 		{"n", "Open batch note capture"},
 		{"?", "Open this help pane"},
 		{"q", "Quit"},
@@ -2393,6 +2531,9 @@ func (m model) renderLogo(width int) string {
 func (m model) openTaskCount() int {
 	count := 0
 	for _, t := range m.state.Tasks {
+		if t.Archived {
+			continue
+		}
 		if t.Status != "done" {
 			count++
 		}
@@ -2403,6 +2544,9 @@ func (m model) openTaskCount() int {
 func (m model) doneTaskCount() int {
 	count := 0
 	for _, t := range m.state.Tasks {
+		if t.Archived {
+			continue
+		}
 		if t.Status == "done" {
 			count++
 		}
@@ -2414,6 +2558,9 @@ func (m model) overdueTaskCount() int {
 	today := time.Now().Format(dateLayout)
 	count := 0
 	for _, t := range m.state.Tasks {
+		if t.Archived {
+			continue
+		}
 		if t.Status == "done" || strings.TrimSpace(t.DueDate) == "" {
 			continue
 		}
@@ -2553,11 +2700,20 @@ func statusPill(status string) string {
 		Bold(true).
 		Padding(0, 1)
 	switch label {
+	case "archived":
+		return style.Foreground(ui.subtle).Render("archived")
 	case "done":
 		return style.Foreground(ui.success).Render("done")
 	default:
 		return style.Foreground(ui.warn).Render("open")
 	}
+}
+
+func archiveLabel(archived bool) string {
+	if archived {
+		return ui.subtitle.Render("archived")
+	}
+	return ui.subtitle.Render("active")
 }
 
 func priorityChip(priority string) string {
