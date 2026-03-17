@@ -181,10 +181,11 @@ type model struct {
 
 	overlay overlayMode
 
-	editingTaskID   string
-	editingMemberID string
-	mouseEnabled    bool
-	config          appConfig
+	editingTaskID    string
+	editingMemberID  string
+	editingProjectID string
+	mouseEnabled     bool
+	config           appConfig
 
 	memberInputs  []textinput.Model
 	taskInputs    []textinput.Model
@@ -934,15 +935,19 @@ func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.setStatus(err.Error())
 				return m, nil
 			}
-			if err := m.activateProject(project); err != nil {
-				m.setStatus(err.Error())
+			if m.editingProjectID == "" {
+				if err := m.activateProject(project); err != nil {
+					m.setStatus(err.Error())
+					return m, nil
+				}
+				if project.Type == projectTypeRemote {
+					m.closeOverlay(fmt.Sprintf("Project %q created. Remote sync is metadata-only for now.", project.Name))
+				} else {
+					m.closeOverlay(fmt.Sprintf("Project %q created.", project.Name))
+				}
 				return m, nil
 			}
-			if project.Type == projectTypeRemote {
-				m.closeOverlay(fmt.Sprintf("Project %q created. Remote sync is metadata-only for now.", project.Name))
-			} else {
-				m.closeOverlay(fmt.Sprintf("Project %q created.", project.Name))
-			}
+			m.closeOverlay(fmt.Sprintf("Project %q updated.", project.Name))
 			return m, nil
 		}
 
@@ -976,6 +981,12 @@ func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n":
 		m.openProjectCreateForm(false)
+		return m, nil
+	case "e":
+		if len(m.projects) == 0 {
+			return m, nil
+		}
+		m.openProjectEditForm(m.projects[m.projectCursor])
 		return m, nil
 	case "enter":
 		if len(m.projects) == 0 {
@@ -1421,9 +1432,15 @@ func (m model) renderOverlay() string {
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayProjects:
 		if m.projectCreate {
+			title := "Create Project"
+			subtitle := "Name the project, choose local or remote, then save. esc cancels unless this is first launch."
+			if m.editingProjectID != "" {
+				title = "Edit Project"
+				subtitle = "Update the project details, then save. esc returns to the project list."
+			}
 			lines := []string{
-				ui.sectionTitle.Render("Create Project"),
-				ui.subtitle.Render("Name the project, choose local or remote, then save. esc cancels unless this is first launch."),
+				ui.sectionTitle.Render(title),
+				ui.subtitle.Render(subtitle),
 				"",
 			}
 			labels := []string{"Name", "Type", "Remote URL"}
@@ -1440,7 +1457,7 @@ func (m model) renderOverlay() string {
 
 		lines := []string{
 			ui.sectionTitle.Render("Projects"),
-			ui.subtitle.Render("j/k move, enter switches, n creates a project, esc closes."),
+			ui.subtitle.Render("j/k or tab move, enter switches, n creates, e edits, esc closes."),
 			"",
 		}
 		if len(m.projects) == 0 {
@@ -1680,6 +1697,7 @@ func (m *model) closeOverlay(status string) {
 	m.formCursor = 0
 	m.editingTaskID = ""
 	m.editingMemberID = ""
+	m.editingProjectID = ""
 	m.projectCreate = false
 	m.projectLocked = false
 	for i := range m.memberInputs {
@@ -1821,12 +1839,29 @@ func (m *model) openProjectCreateForm(locked bool) {
 	m.overlay = overlayProjects
 	m.projectCreate = true
 	m.projectLocked = locked
+	m.editingProjectID = ""
 	m.formCursor = 0
 	for i := range m.projectInputs {
 		m.projectInputs[i].SetValue("")
 		m.projectInputs[i].Blur()
 	}
 	m.projectInputs[1].SetValue(string(projectTypeLocal))
+	m.projectInputs[0].Focus()
+}
+
+func (m *model) openProjectEditForm(project projectRecord) {
+	m.overlay = overlayProjects
+	m.projectCreate = true
+	m.projectLocked = false
+	m.editingProjectID = project.ID
+	m.formCursor = 0
+	for i := range m.projectInputs {
+		m.projectInputs[i].SetValue("")
+		m.projectInputs[i].Blur()
+	}
+	m.projectInputs[0].SetValue(project.Name)
+	m.projectInputs[1].SetValue(string(project.Type))
+	m.projectInputs[2].SetValue(project.RemoteURL)
 	m.projectInputs[0].Focus()
 }
 
@@ -2073,6 +2108,24 @@ func (m *model) submitProjectForm() (projectRecord, error) {
 	remoteURL := strings.TrimSpace(m.projectInputs[2].Value())
 	if kind == projectTypeRemote && remoteURL == "" {
 		return projectRecord{}, errors.New("remote_url is required for remote projects")
+	}
+	if kind == projectTypeLocal {
+		remoteURL = ""
+	}
+	if m.editingProjectID != "" {
+		project, err := updateProjectRecord(m.registryPath, m.editingProjectID, name, kind, remoteURL)
+		if err != nil {
+			return projectRecord{}, err
+		}
+		m.projects, _, err = loadProjectRegistry(m.registryPath)
+		if err != nil {
+			return projectRecord{}, err
+		}
+		m.projectCursor = m.projectIndex(project.ID)
+		if project.ID == m.currentProject.ID {
+			m.currentProject = project
+		}
+		return project, nil
 	}
 	project, err := createProjectRecord(m.registryPath, m.projectsBaseDir, name, kind, remoteURL)
 	if err != nil {
@@ -3290,6 +3343,35 @@ func createProjectRecord(registryPath, projectsBaseDir, name string, kind projec
 		return projectRecord{}, err
 	}
 	return project, nil
+}
+
+func updateProjectRecord(registryPath, projectID, name string, kind projectType, remoteURL string) (projectRecord, error) {
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(
+		`UPDATE projects SET name = ?, type = ?, remote_url = ? WHERE id = ?`,
+		name,
+		string(kind),
+		remoteURL,
+		projectID,
+	); err != nil {
+		return projectRecord{}, err
+	}
+
+	rows, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	for _, project := range rows {
+		if project.ID == projectID {
+			return project, nil
+		}
+	}
+	return projectRecord{}, errors.New("project not found after update")
 }
 
 func touchProjectLastOpened(path, projectID string, openedAt time.Time) error {
