@@ -25,12 +25,15 @@ import (
 )
 
 const (
-	appTitle         = "ProMag"
-	dateLayout       = "2006-01-02"
-	storageFile      = "promag.sqlite3"
-	legacyStateFile  = "promag-data.json"
-	legacyConfigFile = "promag-config.json"
-	minLeftWidth     = 40
+	appTitle          = "ProMag"
+	dateLayout        = "2006-01-02"
+	storageDir        = ".promag"
+	registryFile      = "registry.sqlite3"
+	projectsDir       = "projects"
+	legacyStorageFile = "promag.sqlite3"
+	legacyStateFile   = "promag-data.json"
+	legacyConfigFile  = "promag-config.json"
+	minLeftWidth      = 40
 )
 
 var naturalDateParser = when.EN
@@ -59,6 +62,14 @@ const (
 	overlayNote     overlayMode = "note"
 	overlayFilter   overlayMode = "filter"
 	overlaySettings overlayMode = "settings"
+	overlayProjects overlayMode = "projects"
+)
+
+type projectType string
+
+const (
+	projectTypeLocal  projectType = "local"
+	projectTypeRemote projectType = "remote"
 )
 
 type zone struct {
@@ -99,6 +110,16 @@ type appConfig struct {
 	LeftWheelMode string `json:"left_wheel_mode"`
 }
 
+type projectRecord struct {
+	ID           string
+	Name         string
+	Type         projectType
+	RemoteURL    string
+	DBPath       string
+	CreatedAt    time.Time
+	LastOpenedAt time.Time
+}
+
 func defaultConfig() appConfig {
 	return appConfig{
 		LeftWheelMode: "scroll_list",
@@ -135,8 +156,12 @@ type layoutState struct {
 }
 
 type model struct {
-	dbPath string
-	state  appState
+	dbPath          string
+	state           appState
+	registryPath    string
+	projectsBaseDir string
+	projects        []projectRecord
+	currentProject  projectRecord
 
 	width   int
 	height  int
@@ -161,17 +186,21 @@ type model struct {
 	mouseEnabled    bool
 	config          appConfig
 
-	memberInputs []textinput.Model
-	taskInputs   []textinput.Model
-	filterInputs []textinput.Model
-	noteInputs   []textinput.Model
-	noteInput    textarea.Model
-	formCursor   int
+	memberInputs  []textinput.Model
+	taskInputs    []textinput.Model
+	filterInputs  []textinput.Model
+	noteInputs    []textinput.Model
+	noteInput     textarea.Model
+	projectInputs []textinput.Model
+	formCursor    int
 
-	pendingG     bool
-	filter       filterState
-	detailScroll map[viewMode]int
-	listOffset   map[viewMode]int
+	pendingG      bool
+	filter        filterState
+	detailScroll  map[viewMode]int
+	listOffset    map[viewMode]int
+	projectCursor int
+	projectCreate bool
+	projectLocked bool
 }
 
 type filterState struct {
@@ -294,19 +323,51 @@ func main() {
 	}
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
 
-	path := filepath.Join(".", storageFile)
-	state, err := loadState(path)
+	registryPath := filepath.Join(".", storageDir, registryFile)
+	projectsBaseDir := filepath.Join(".", storageDir, projectsDir)
+	projects, lastProjectID, err := loadProjectRegistry(registryPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load state: %v\n", err)
+		fmt.Fprintf(os.Stderr, "load project registry: %v\n", err)
 		os.Exit(1)
 	}
-	cfg, err := loadConfig(path)
+	projects, lastProjectID, err = bootstrapDefaultProject(registryPath, projectsBaseDir, projects, lastProjectID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "bootstrap project registry: %v\n", err)
 		os.Exit(1)
 	}
 
-	model := newModel(path, state, cfg)
+	var (
+		activeProject projectRecord
+		state         appState
+		cfg           appConfig
+	)
+	if project, ok := chooseActiveProject(projects, lastProjectID); ok {
+		activeProject = project
+		state, err = loadState(project.DBPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load state: %v\n", err)
+			os.Exit(1)
+		}
+		cfg, err = loadConfig(project.DBPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := touchProjectLastOpened(registryPath, project.ID, time.Now()); err != nil {
+			fmt.Fprintf(os.Stderr, "update project registry: %v\n", err)
+			os.Exit(1)
+		}
+		projects, _, err = loadProjectRegistry(registryPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "reload project registry: %v\n", err)
+			os.Exit(1)
+		}
+		activeProject, _ = chooseActiveProject(projects, project.ID)
+	} else {
+		cfg = defaultConfig()
+	}
+
+	model := newModel(registryPath, projectsBaseDir, activeProject, projects, state, cfg)
 	if width, height, ok := detectTerminalSize(); ok {
 		model.width = width
 		model.height = height
@@ -329,7 +390,7 @@ func main() {
 	}
 }
 
-func newModel(path string, state appState, cfg appConfig) model {
+func newModel(registryPath, projectsBaseDir string, project projectRecord, projects []projectRecord, state appState, cfg appConfig) model {
 	memberInputs := make([]textinput.Model, 3)
 	memberPlaceholders := []string{"Member name", "Role or specialty", "Email or handle"}
 	for i := range memberInputs {
@@ -396,24 +457,47 @@ func newModel(path string, state appState, cfg appConfig) model {
 	noteInput.SetHeight(14)
 	noteInput.Focus()
 
+	projectInputs := make([]textinput.Model, 3)
+	projectPlaceholders := []string{
+		"Project name",
+		"Type: local or remote",
+		"Remote URL (required for remote)",
+	}
+	for i := range projectInputs {
+		in := textinput.New()
+		in.Placeholder = projectPlaceholders[i]
+		in.Prompt = ""
+		in.CharLimit = 256
+		projectInputs[i] = in
+	}
+
 	model := model{
-		dbPath:       path,
-		state:        state,
-		config:       cfg,
-		activeView:   viewTasks,
-		cursor:       map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
-		memberInputs: memberInputs,
-		taskInputs:   taskInputs,
-		filterInputs: filterInputs,
-		noteInputs:   noteInputs,
-		noteInput:    noteInput,
-		mouseEnabled: true,
-		lastStatus:   "Ready. Press ? for the full manual.",
-		statusAt:     time.Now(),
-		detailScroll: map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
-		listOffset:   map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
+		dbPath:          project.DBPath,
+		state:           state,
+		registryPath:    registryPath,
+		projectsBaseDir: projectsBaseDir,
+		projects:        projects,
+		currentProject:  project,
+		config:          cfg,
+		activeView:      viewTasks,
+		cursor:          map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
+		memberInputs:    memberInputs,
+		taskInputs:      taskInputs,
+		filterInputs:    filterInputs,
+		noteInputs:      noteInputs,
+		noteInput:       noteInput,
+		projectInputs:   projectInputs,
+		mouseEnabled:    true,
+		lastStatus:      "Ready. Press ? for the full manual.",
+		statusAt:        time.Now(),
+		detailScroll:    map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
+		listOffset:      map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 	}
 	model.refreshMemberSuggestions()
+	if len(projects) == 0 {
+		model.openProjectCreateForm(true)
+		model.lastStatus = "Create your first project to start using ProMag."
+	}
 	return model
 }
 
@@ -506,6 +590,8 @@ func (m model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleFilterForm(msg)
 	case overlaySettings:
 		return m.handleSettingsForm(msg)
+	case overlayProjects:
+		return m.handleProjectOverlay(msg)
 	default:
 		return m, nil
 	}
@@ -608,6 +694,9 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "n":
 		m.openNoteForm()
+		return m, nil
+	case "p":
+		m.openProjectSwitcher()
 		return m, nil
 	case "s":
 		m.openSettings()
@@ -823,6 +912,87 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.projectCreate {
+		switch msg.String() {
+		case "esc":
+			if m.projectLocked {
+				m.setStatus("Create a project to continue.")
+				return m, nil
+			}
+			m.projectCreate = false
+			m.formCursor = 0
+			m.projectCursor = m.projectIndex(m.currentProject.ID)
+			m.setStatus("Project creation cancelled.")
+			return m, nil
+		case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
+			m.navigateForm(m.projectFieldCount(), msg.String())
+			return m, nil
+		case "enter", "ctrl+s":
+			project, err := m.submitProjectForm()
+			if err != nil {
+				m.setStatus(err.Error())
+				return m, nil
+			}
+			if err := m.activateProject(project); err != nil {
+				m.setStatus(err.Error())
+				return m, nil
+			}
+			if project.Type == projectTypeRemote {
+				m.closeOverlay(fmt.Sprintf("Project %q created. Remote sync is metadata-only for now.", project.Name))
+			} else {
+				m.closeOverlay(fmt.Sprintf("Project %q created.", project.Name))
+			}
+			return m, nil
+		}
+
+		var cmd tea.Cmd
+		m.projectInputs[m.formCursor], cmd = m.projectInputs[m.formCursor].Update(msg)
+		return m, cmd
+	}
+
+	switch msg.String() {
+	case "esc":
+		if m.projectLocked {
+			m.setStatus("Create a project to continue.")
+			return m, nil
+		}
+		m.closeOverlay("Project switcher closed.")
+		return m, nil
+	case "j", "down", "tab":
+		if len(m.projects) == 0 {
+			return m, nil
+		}
+		m.projectCursor = (m.projectCursor + 1) % len(m.projects)
+		return m, nil
+	case "k", "up", "shift+tab":
+		if len(m.projects) == 0 {
+			return m, nil
+		}
+		m.projectCursor--
+		if m.projectCursor < 0 {
+			m.projectCursor = len(m.projects) - 1
+		}
+		return m, nil
+	case "n":
+		m.openProjectCreateForm(false)
+		return m, nil
+	case "enter":
+		if len(m.projects) == 0 {
+			m.openProjectCreateForm(true)
+			return m, nil
+		}
+		project := m.projects[m.projectCursor]
+		if err := m.activateProject(project); err != nil {
+			m.setStatus(err.Error())
+			return m, nil
+		}
+		m.closeOverlay(fmt.Sprintf("Switched to project %q.", project.Name))
+		return m, nil
+	}
+	return m, nil
+}
+
 func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -857,6 +1027,10 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n":
 		m.closeOverlay("")
 		m.openNoteForm()
+		return m, nil
+	case "p":
+		m.closeOverlay("")
+		m.openProjectSwitcher()
 		return m, nil
 	case "f", "/":
 		m.closeOverlay("")
@@ -937,6 +1111,7 @@ func (m model) renderHeader() string {
 	tabsLine := strings.Join(tabParts, " ")
 	statsLine := lipgloss.JoinHorizontal(
 		lipgloss.Top,
+		m.renderMetric("Project", fallback(m.currentProject.Name, "none"), ui.accent),
 		m.renderMetric("Open", fmt.Sprintf("%d", m.openTaskCount()), ui.warn),
 		m.renderMetric("Done", fmt.Sprintf("%d", m.doneTaskCount()), ui.success),
 		m.renderMetric("Overdue", fmt.Sprintf("%d", m.overdueTaskCount()), ui.danger),
@@ -1129,6 +1304,8 @@ func (m model) renderStatus() string {
 		lipgloss.Top,
 		ui.keycap.Render(":"),
 		" actions ",
+		ui.keycap.Render("p"),
+		" projects ",
 		ui.keycap.Render("s"),
 		" settings ",
 		ui.keycap.Render("M"),
@@ -1158,6 +1335,7 @@ func (m model) renderOverlay() string {
 			"  e   Edit Selected",
 			"  m   Add Team Member",
 			"  n   Quick Note Capture",
+			"  p   Projects",
 			"  f   Filters",
 			"  s   Settings",
 			"  z   Archive Completed Task",
@@ -1239,6 +1417,56 @@ func (m model) renderOverlay() string {
 			"",
 			ui.subtitle.Render("scroll_list keeps the selected task pinned while the list viewport moves."),
 			ui.subtitle.Render("move_selection makes the wheel move the selected row directly."),
+		}
+		return bg.Render(strings.Join(lines, "\n"))
+	case overlayProjects:
+		if m.projectCreate {
+			lines := []string{
+				ui.sectionTitle.Render("Create Project"),
+				ui.subtitle.Render("Name the project, choose local or remote, then save. esc cancels unless this is first launch."),
+				"",
+			}
+			labels := []string{"Name", "Type", "Remote URL"}
+			for i := 0; i < m.projectFieldCount(); i++ {
+				lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
+				lines = append(lines, m.projectInputs[i].View())
+			}
+			if normalizeProjectType(m.projectInputs[1].Value()) == projectTypeRemote {
+				lines = append(lines, "")
+				lines = append(lines, ui.subtitle.Render("Remote projects still use a local cache DB for now."))
+			}
+			return bg.Render(strings.Join(lines, "\n"))
+		}
+
+		lines := []string{
+			ui.sectionTitle.Render("Projects"),
+			ui.subtitle.Render("j/k move, enter switches, n creates a project, esc closes."),
+			"",
+		}
+		if len(m.projects) == 0 {
+			lines = append(lines, ui.subtitle.Render("No projects yet. Press n to create one."))
+			return bg.Render(strings.Join(lines, "\n"))
+		}
+		for i, project := range m.projects {
+			prefix := "  "
+			typeLabel := projectTypeBadge(project.Type)
+			label := ui.subtitle.Render(typeLabel + " " + project.Name)
+			if i == m.projectCursor {
+				prefix = lipgloss.NewStyle().Foreground(ui.accentSoft).Render("› ")
+				label = ui.eyebrow.Render(typeLabel + " " + project.Name)
+			}
+			if project.ID == m.currentProject.ID {
+				current := lipgloss.NewStyle().Foreground(ui.success).Bold(true).Render("current")
+				label = label + ui.subtitle.Render(" • ") + current
+			}
+			meta := ""
+			if project.RemoteURL != "" {
+				meta = truncate(project.RemoteURL, 40)
+			}
+			lines = append(lines, prefix+label)
+			if meta != "" {
+				lines = append(lines, "  "+ui.subtitle.Render(meta))
+			}
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	default:
@@ -1452,6 +1680,8 @@ func (m *model) closeOverlay(status string) {
 	m.formCursor = 0
 	m.editingTaskID = ""
 	m.editingMemberID = ""
+	m.projectCreate = false
+	m.projectLocked = false
 	for i := range m.memberInputs {
 		m.memberInputs[i].Blur()
 	}
@@ -1465,6 +1695,9 @@ func (m *model) closeOverlay(status string) {
 		m.noteInputs[i].Blur()
 	}
 	m.noteInput.Blur()
+	for i := range m.projectInputs {
+		m.projectInputs[i].Blur()
+	}
 	if status != "" {
 		m.setStatus(status)
 	}
@@ -1576,6 +1809,27 @@ func (m *model) openSettings() {
 	m.formCursor = 0
 }
 
+func (m *model) openProjectSwitcher() {
+	m.overlay = overlayProjects
+	m.projectCreate = false
+	m.projectLocked = false
+	m.formCursor = 0
+	m.projectCursor = m.projectIndex(m.currentProject.ID)
+}
+
+func (m *model) openProjectCreateForm(locked bool) {
+	m.overlay = overlayProjects
+	m.projectCreate = true
+	m.projectLocked = locked
+	m.formCursor = 0
+	for i := range m.projectInputs {
+		m.projectInputs[i].SetValue("")
+		m.projectInputs[i].Blur()
+	}
+	m.projectInputs[1].SetValue(string(projectTypeLocal))
+	m.projectInputs[0].Focus()
+}
+
 func (m *model) navigateForm(total int, direction string) {
 	if total == 0 {
 		return
@@ -1600,6 +1854,11 @@ func (m *model) navigateForm(total int, direction string) {
 			m.noteInputs[i].Blur()
 		}
 		m.noteInput.Blur()
+	}
+	if m.overlay == overlayProjects {
+		for i := range m.projectInputs {
+			m.projectInputs[i].Blur()
+		}
 	}
 
 	switch direction {
@@ -1627,6 +1886,9 @@ func (m *model) navigateForm(total int, direction string) {
 		} else {
 			m.noteInput.Focus()
 		}
+	}
+	if m.overlay == overlayProjects && m.formCursor < len(m.projectInputs) {
+		m.projectInputs[m.formCursor].Focus()
 	}
 }
 
@@ -1797,6 +2059,88 @@ func (m *model) submitFilterForm() error {
 		m.cursor[view] = 0
 	}
 	return nil
+}
+
+func (m *model) submitProjectForm() (projectRecord, error) {
+	name := strings.TrimSpace(m.projectInputs[0].Value())
+	if name == "" {
+		return projectRecord{}, errors.New("project name is required")
+	}
+	kind := normalizeProjectType(m.projectInputs[1].Value())
+	if kind == "" {
+		return projectRecord{}, errors.New("project type must be local or remote")
+	}
+	remoteURL := strings.TrimSpace(m.projectInputs[2].Value())
+	if kind == projectTypeRemote && remoteURL == "" {
+		return projectRecord{}, errors.New("remote_url is required for remote projects")
+	}
+	project, err := createProjectRecord(m.registryPath, m.projectsBaseDir, name, kind, remoteURL)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	m.projects, _, err = loadProjectRegistry(m.registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	m.projectCursor = m.projectIndex(project.ID)
+	return project, nil
+}
+
+func (m *model) activateProject(project projectRecord) error {
+	state, err := loadState(project.DBPath)
+	if err != nil {
+		return fmt.Errorf("load project %q: %w", project.Name, err)
+	}
+	cfg, err := loadConfig(project.DBPath)
+	if err != nil {
+		return fmt.Errorf("load project config %q: %w", project.Name, err)
+	}
+	if err := touchProjectLastOpened(m.registryPath, project.ID, time.Now()); err != nil {
+		return fmt.Errorf("update last project: %w", err)
+	}
+	projects, _, err := loadProjectRegistry(m.registryPath)
+	if err != nil {
+		return fmt.Errorf("reload projects: %w", err)
+	}
+	selected, ok := chooseActiveProject(projects, project.ID)
+	if !ok {
+		return errors.New("project was not found after switching")
+	}
+
+	m.dbPath = selected.DBPath
+	m.state = state
+	m.config = cfg
+	m.projects = projects
+	m.currentProject = selected
+	m.filter = filterState{}
+	m.projectCursor = m.projectIndex(selected.ID)
+	m.activeView = viewTasks
+	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive, viewHelp} {
+		m.cursor[view] = 0
+		m.listOffset[view] = 0
+		m.detailScroll[view] = 0
+	}
+	for i := range m.filterInputs {
+		m.filterInputs[i].SetValue("")
+	}
+	m.refreshMemberSuggestions()
+	return nil
+}
+
+func (m model) projectIndex(id string) int {
+	for i, project := range m.projects {
+		if project.ID == id {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m model) projectFieldCount() int {
+	if normalizeProjectType(m.projectInputs[1].Value()) == projectTypeRemote {
+		return 3
+	}
+	return 2
 }
 
 func (m *model) clearFilters() {
@@ -2117,15 +2461,15 @@ func (m model) dateDetail() string {
 func (m model) listHint() string {
 	switch m.activeView {
 	case viewTasks:
-		return "j/k move • space mark done • z archive done task • t add task • n quick notes • f filter"
+		return "j/k move • space mark done • z archive done task • t add task • n quick notes • f filter • p projects"
 	case viewMembers:
-		return "j/k move • m add member • t add task for selected member • f filter"
+		return "j/k move • m add member • t add task for selected member • f filter • p projects"
 	case viewDates:
-		return "j/k move • grouped by due date • full tasks on right • f filter"
+		return "j/k move • grouped by due date • full tasks on right • f filter • p projects"
 	case viewArchive:
-		return "j/k move • r restore • x delete permanently"
+		return "j/k move • r restore • x delete permanently • p projects"
 	case viewHelp:
-		return "Full manual on the right pane"
+		return "Full manual on the right pane • p projects"
 	default:
 		return ""
 	}
@@ -2163,6 +2507,9 @@ func (m model) resizeEditors() {
 	}
 	for i := range m.noteInputs {
 		m.noteInputs[i].Width = width - 4
+	}
+	for i := range m.projectInputs {
+		m.projectInputs[i].Width = width - 4
 	}
 }
 
@@ -2789,6 +3136,234 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func loadProjectRegistry(path string) ([]projectRecord, string, error) {
+	db, err := openProjectRegistry(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, name, type, remote_url, db_path, created_at, last_opened_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, lower(name) ASC`)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+
+	var projects []projectRecord
+	for rows.Next() {
+		var (
+			project      projectRecord
+			projectTypeV string
+			createdAt    string
+			lastOpenedAt string
+		)
+		if err := rows.Scan(&project.ID, &project.Name, &projectTypeV, &project.RemoteURL, &project.DBPath, &createdAt, &lastOpenedAt); err != nil {
+			return nil, "", err
+		}
+		project.Type = normalizeProjectType(projectTypeV)
+		if project.Type == "" {
+			project.Type = projectTypeLocal
+		}
+		if createdAt != "" {
+			project.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		if lastOpenedAt != "" {
+			project.LastOpenedAt, err = time.Parse(time.RFC3339Nano, lastOpenedAt)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	var lastProjectID string
+	if err := db.QueryRow(`SELECT value FROM app_meta WHERE key = 'last_project_id'`).Scan(&lastProjectID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, "", err
+	}
+	return projects, lastProjectID, nil
+}
+
+func bootstrapDefaultProject(registryPath, projectsBaseDir string, projects []projectRecord, lastProjectID string) ([]projectRecord, string, error) {
+	if len(projects) > 0 {
+		return projects, lastProjectID, nil
+	}
+
+	legacyPath := filepath.Join(".", legacyStorageFile)
+	if !fileExists(legacyPath) && !fileExists(filepath.Join(".", legacyStateFile)) && !fileExists(filepath.Join(".", legacyConfigFile)) {
+		return projects, lastProjectID, nil
+	}
+
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Default Project", projectTypeLocal, "")
+	if err != nil {
+		return nil, "", err
+	}
+
+	var (
+		state appState
+		cfg   appConfig
+	)
+	if fileExists(legacyPath) {
+		state, err = loadState(legacyPath)
+		if err != nil {
+			return nil, "", err
+		}
+		cfg, err = loadConfig(legacyPath)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
+		state, err = loadLegacyState(filepath.Join(".", legacyStateFile))
+		if err != nil {
+			return nil, "", err
+		}
+		cfg, err = loadLegacyConfig(filepath.Join(".", legacyConfigFile))
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if err := saveState(project.DBPath, state); err != nil {
+		return nil, "", err
+	}
+	if err := saveConfig(project.DBPath, cfg); err != nil {
+		return nil, "", err
+	}
+	return loadProjectRegistry(registryPath)
+}
+
+func chooseActiveProject(projects []projectRecord, lastProjectID string) (projectRecord, bool) {
+	if len(projects) == 0 {
+		return projectRecord{}, false
+	}
+	if lastProjectID != "" {
+		for _, project := range projects {
+			if project.ID == lastProjectID {
+				return project, true
+			}
+		}
+	}
+	return projects[0], true
+}
+
+func createProjectRecord(registryPath, projectsBaseDir, name string, kind projectType, remoteURL string) (projectRecord, error) {
+	if err := os.MkdirAll(projectsBaseDir, 0o755); err != nil {
+		return projectRecord{}, err
+	}
+	now := time.Now()
+	project := projectRecord{
+		ID:           nextID("prj", now),
+		Name:         name,
+		Type:         kind,
+		RemoteURL:    remoteURL,
+		DBPath:       filepath.Join(projectsBaseDir, nextID("db", now)+".sqlite3"),
+		CreatedAt:    now,
+		LastOpenedAt: now,
+	}
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		`INSERT INTO projects (id, name, type, remote_url, db_path, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		project.ID,
+		project.Name,
+		string(project.Type),
+		project.RemoteURL,
+		project.DBPath,
+		project.CreatedAt.Format(time.RFC3339Nano),
+		project.LastOpenedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	if err := saveLastProjectID(db, project.ID); err != nil {
+		return projectRecord{}, err
+	}
+	if err := saveConfig(project.DBPath, defaultConfig()); err != nil {
+		return projectRecord{}, err
+	}
+	return project, nil
+}
+
+func touchProjectLastOpened(path, projectID string, openedAt time.Time) error {
+	db, err := openProjectRegistry(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`UPDATE projects SET last_opened_at = ? WHERE id = ?`, openedAt.Format(time.RFC3339Nano), projectID); err != nil {
+		return err
+	}
+	return saveLastProjectID(db, projectID)
+}
+
+func openProjectRegistry(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS projects (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			type TEXT NOT NULL,
+			remote_url TEXT NOT NULL,
+			db_path TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_opened_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS app_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func saveLastProjectID(db *sql.DB, projectID string) error {
+	_, err := db.Exec(
+		`INSERT INTO app_meta (key, value) VALUES ('last_project_id', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		projectID,
+	)
+	return err
+}
+
+func normalizeProjectType(raw string) projectType {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case string(projectTypeLocal), "":
+		return projectTypeLocal
+	case string(projectTypeRemote):
+		return projectTypeRemote
+	default:
+		return ""
+	}
+}
+
+func projectTypeBadge(kind projectType) string {
+	switch kind {
+	case projectTypeRemote:
+		return "R"
+	default:
+		return "L"
+	}
+}
+
 func normalizeDueInput(raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -2992,9 +3567,14 @@ func helpManual(width int) string {
 		"- Draft sprint notes @Sara",
 		"Task form and filter fields also accept: tomorrow, next friday, in 3 days, Mar 20.",
 		"",
+		"Projects",
+		"Press p to switch projects or create a new one inside the TUI.",
+		"ProMag remembers the last project you opened and restores it on the next launch.",
+		"Remote projects currently store remote_url metadata and still use a local cache DB.",
+		"",
 		"Data",
-		"Everything is stored locally in promag.sqlite3 in this project directory.",
-		"Legacy promag-data.json and promag-config.json are imported automatically when present.",
+		"Project registry and project databases live under .promag/ in this project directory.",
+		"Legacy promag.sqlite3, promag-data.json, and promag-config.json are imported automatically when present.",
 		"Use s to open settings in-app.",
 		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",
 		"Due dates use YYYY-MM-DD.",
@@ -3015,6 +3595,7 @@ func manualKeybindTable(width int) string {
 		{"left click", "Select a tab or row"},
 		{"M", "Toggle app mouse vs terminal selection"},
 		{"m", "Open member form"},
+		{"p", "Open project switcher / create project"},
 		{"s", "Open settings"},
 		{"e", "Edit selected task or member"},
 		{"t", "Open task form"},

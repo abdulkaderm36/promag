@@ -1,6 +1,6 @@
 # ProMag
 
-ProMag is a Bubble Tea-based project management TUI written in Go. It is built for keyboard-first task tracking, but also supports mouse interaction, local SQLite persistence, archive workflows, and batch task capture.
+ProMag is a Bubble Tea-based project management TUI written in Go. It is built for keyboard-first task tracking, but also supports mouse interaction, per-project SQLite persistence, archive workflows, batch task capture, and in-app project switching.
 
 ## What It Does
 
@@ -9,7 +9,8 @@ ProMag is a Bubble Tea-based project management TUI written in Go. It is built f
 - Track task status, due dates, comments, tags, priority, and assignees
 - Archive completed tasks without deleting them
 - Capture multiple tasks quickly from plain-text notes
-- Persist board state locally in a SQLite database file
+- Persist each project locally in its own SQLite database file
+- Switch between projects and create new ones inside the TUI
 
 ## Requirements
 
@@ -24,8 +25,12 @@ Run the app from the project root:
 go run .
 ```
 
-This creates and uses `promag.sqlite3` for tasks, members, and UI behavior settings.
-If legacy `promag-data.json` or `promag-config.json` files are present, they are imported automatically on first run.
+This creates a local `.promag/` directory with:
+
+- `registry.sqlite3` for the project registry and last-opened project
+- `projects/*.sqlite3` for per-project data and settings
+
+If legacy `promag.sqlite3`, `promag-data.json`, or `promag-config.json` files are present, they are imported automatically into a default project on first run.
 
 ## Build And Install
 
@@ -65,7 +70,7 @@ go run . --debug --debug-hitboxes
 
 ## Configuration
 
-Behavior settings are stored in `promag.sqlite3`.
+Behavior settings are stored inside each project's SQLite database.
 
 Current settings:
 
@@ -76,7 +81,7 @@ Current settings:
 You can change settings in either of these ways:
 
 1. In-app: press `s`, use `up` / `down` or `tab` / `shift+tab`, then press `enter` or `ctrl+s`
-2. Manually: inspect or edit the `config` table in `promag.sqlite3`
+2. Manually: inspect or edit the active project's `config` table in `.promag/projects/*.sqlite3`
 
 ## Controls
 
@@ -102,6 +107,7 @@ You can change settings in either of these ways:
 - `t`: open task form
 - `e`: edit selected task or member
 - `n`: open batch note capture
+- `p`: open project switcher / create a project
 - `f` or `/`: open filters
 - `F`: clear all filters
 - `s`: open settings
@@ -158,10 +164,12 @@ Task and filter forms also accept natural-language dates such as `tomorrow`, `ne
 
 ## Data Files
 
-- `promag.sqlite3`
-  - Stores members, tasks, and UI settings
-- Legacy `promag-data.json` / `promag-config.json`
-  - Imported automatically if they still exist when the app first opens the SQLite database
+- `.promag/registry.sqlite3`
+  - Stores project metadata and the last-opened project
+- `.promag/projects/*.sqlite3`
+  - Stores members, tasks, and UI settings for each project
+- Legacy `promag.sqlite3` / `promag-data.json` / `promag-config.json`
+  - Imported automatically into a default project if they still exist on first run
 
 Due dates are stored as `YYYY-MM-DD`.
 
