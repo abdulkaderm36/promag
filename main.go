@@ -727,7 +727,7 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		m.closeOverlay("Member entry cancelled.")
 		return m, nil
 	case "tab", "shift+tab", "enter", "ctrl+j", "ctrl+k", "up", "down":
@@ -766,7 +766,7 @@ func (m model) handleMemberForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		m.closeOverlay("Task entry cancelled.")
 		return m, nil
 	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
@@ -812,7 +812,7 @@ func (m model) handleTaskForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		m.closeOverlay("Quick note capture cancelled.")
 		return m, nil
 	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
@@ -850,7 +850,7 @@ func (m model) handleNoteForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		m.closeOverlay("Filter edit cancelled.")
 		return m, nil
 	case "tab", "shift+tab", "ctrl+j", "ctrl+k", "up", "down":
@@ -892,7 +892,7 @@ func (m model) handleFilterForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		m.closeOverlay("Settings cancelled.")
 		return m, nil
 	case "up", "down", "tab", "shift+tab", "ctrl+j", "ctrl+k":
@@ -916,7 +916,7 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.projectCreate {
 		switch msg.String() {
-		case "esc":
+		case "esc", "q":
 			if m.projectLocked {
 				m.setStatus("Create a project to continue.")
 				return m, nil
@@ -957,7 +957,7 @@ func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "esc":
+	case "esc", "q":
 		if m.projectLocked {
 			m.setStatus("Create a project to continue.")
 			return m, nil
