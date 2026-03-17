@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,14 +21,16 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
 	"github.com/olebedev/when"
+	_ "modernc.org/sqlite"
 )
 
 const (
-	appTitle     = "ProMag"
-	dateLayout   = "2006-01-02"
-	storageFile  = "promag-data.json"
-	configFile   = "promag-config.json"
-	minLeftWidth = 40
+	appTitle         = "ProMag"
+	dateLayout       = "2006-01-02"
+	storageFile      = "promag.sqlite3"
+	legacyStateFile  = "promag-data.json"
+	legacyConfigFile = "promag-config.json"
+	minLeftWidth     = 40
 )
 
 var naturalDateParser = when.EN
@@ -132,9 +135,8 @@ type layoutState struct {
 }
 
 type model struct {
-	dataPath   string
-	configPath string
-	state      appState
+	dbPath string
+	state  appState
 
 	width   int
 	height  int
@@ -293,19 +295,18 @@ func main() {
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
 
 	path := filepath.Join(".", storageFile)
-	configPath := filepath.Join(".", configFile)
 	state, err := loadState(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load state: %v\n", err)
 		os.Exit(1)
 	}
-	cfg, err := loadConfig(configPath)
+	cfg, err := loadConfig(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
 	}
 
-	model := newModel(path, configPath, state, cfg)
+	model := newModel(path, state, cfg)
 	if width, height, ok := detectTerminalSize(); ok {
 		model.width = width
 		model.height = height
@@ -328,7 +329,7 @@ func main() {
 	}
 }
 
-func newModel(path, configPath string, state appState, cfg appConfig) model {
+func newModel(path string, state appState, cfg appConfig) model {
 	memberInputs := make([]textinput.Model, 3)
 	memberPlaceholders := []string{"Member name", "Role or specialty", "Email or handle"}
 	for i := range memberInputs {
@@ -396,8 +397,7 @@ func newModel(path, configPath string, state appState, cfg appConfig) model {
 	noteInput.Focus()
 
 	model := model{
-		dataPath:     path,
-		configPath:   configPath,
+		dbPath:       path,
 		state:        state,
 		config:       cfg,
 		activeView:   viewTasks,
@@ -813,7 +813,7 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter", "ctrl+s":
-		if err := saveConfig(m.configPath, m.config); err != nil {
+		if err := saveConfig(m.dbPath, m.config); err != nil {
 			m.setStatus(fmt.Sprintf("save config: %v", err))
 			return m, nil
 		}
@@ -1650,7 +1650,7 @@ func (m *model) submitMemberForm() error {
 			m.state.Members[i].Role = role
 			m.state.Members[i].Email = email
 			m.refreshMemberSuggestions()
-			return saveState(m.dataPath, m.state)
+			return saveState(m.dbPath, m.state)
 		}
 		return errors.New("member to edit was not found")
 	}
@@ -1661,7 +1661,7 @@ func (m *model) submitMemberForm() error {
 		Email: email,
 	})
 	m.refreshMemberSuggestions()
-	return saveState(m.dataPath, m.state)
+	return saveState(m.dbPath, m.state)
 }
 
 func (m *model) submitTaskForm() error {
@@ -1709,7 +1709,7 @@ func (m *model) submitTaskForm() error {
 			m.state.Tasks[i].Tags = tags
 			m.state.Tasks[i].Comments = comments
 			m.state.Tasks[i].DueDate = dueDate
-			if err := saveState(m.dataPath, m.state); err != nil {
+			if err := saveState(m.dbPath, m.state); err != nil {
 				return err
 			}
 			m.activeView = viewTasks
@@ -1733,7 +1733,7 @@ func (m *model) submitTaskForm() error {
 		})
 	}
 
-	if err := saveState(m.dataPath, m.state); err != nil {
+	if err := saveState(m.dbPath, m.state); err != nil {
 		return err
 	}
 	m.activeView = viewTasks
@@ -1754,7 +1754,7 @@ func (m *model) submitNoteForm() (int, error) {
 		return 0, errors.New("quick note did not produce any tasks")
 	}
 	m.state.Tasks = append(m.state.Tasks, tasks...)
-	if err := saveState(m.dataPath, m.state); err != nil {
+	if err := saveState(m.dbPath, m.state); err != nil {
 		return 0, err
 	}
 	m.activeView = viewTasks
@@ -1856,7 +1856,7 @@ func (m model) toggleSelectedTask() model {
 		}
 		break
 	}
-	if err := saveState(m.dataPath, m.state); err != nil {
+	if err := saveState(m.dbPath, m.state); err != nil {
 		m.setStatus("save failed: " + err.Error())
 	}
 	return m
@@ -1883,7 +1883,7 @@ func (m model) archiveSelectedTask() model {
 		m.state.Tasks[i].Archived = true
 		break
 	}
-	if err := saveState(m.dataPath, m.state); err != nil {
+	if err := saveState(m.dbPath, m.state); err != nil {
 		m.setStatus("save failed: " + err.Error())
 		return m
 	}
@@ -1909,7 +1909,7 @@ func (m model) restoreSelectedTask() model {
 		m.state.Tasks[i].Archived = false
 		break
 	}
-	if err := saveState(m.dataPath, m.state); err != nil {
+	if err := saveState(m.dbPath, m.state); err != nil {
 		m.setStatus("save failed: " + err.Error())
 		return m
 	}
@@ -1927,7 +1927,7 @@ func (m model) deleteSelected() model {
 			return m
 		}
 		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
-		if err := saveState(m.dataPath, m.state); err != nil {
+		if err := saveState(m.dbPath, m.state); err != nil {
 			m.setStatus("save failed: " + err.Error())
 			return m
 		}
@@ -1939,7 +1939,7 @@ func (m model) deleteSelected() model {
 			return m
 		}
 		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
-		if err := saveState(m.dataPath, m.state); err != nil {
+		if err := saveState(m.dbPath, m.state); err != nil {
 			m.setStatus("save failed: " + err.Error())
 			return m
 		}
@@ -1957,7 +1957,7 @@ func (m model) deleteSelected() model {
 		}
 		m.state.Members = slices.DeleteFunc(m.state.Members, func(mem member) bool { return mem.ID == selected.ID })
 		m.refreshMemberSuggestions()
-		if err := saveState(m.dataPath, m.state); err != nil {
+		if err := saveState(m.dbPath, m.state); err != nil {
 			m.setStatus("save failed: " + err.Error())
 			return m
 		}
@@ -2451,6 +2451,303 @@ func (m model) findMemberByName(name string) *member {
 }
 
 func loadState(path string) (appState, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return appState{}, err
+	}
+	defer db.Close()
+
+	if err := migrateLegacyFiles(db); err != nil {
+		return appState{}, err
+	}
+
+	state := appState{}
+
+	memberRows, err := db.Query(`SELECT id, name, role, email FROM members ORDER BY rowid`)
+	if err != nil {
+		return state, err
+	}
+	defer memberRows.Close()
+
+	for memberRows.Next() {
+		var mem member
+		if err := memberRows.Scan(&mem.ID, &mem.Name, &mem.Role, &mem.Email); err != nil {
+			return state, err
+		}
+		state.Members = append(state.Members, mem)
+	}
+	if err := memberRows.Err(); err != nil {
+		return state, err
+	}
+
+	taskRows, err := db.Query(`SELECT id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at FROM tasks ORDER BY rowid`)
+	if err != nil {
+		return state, err
+	}
+	defer taskRows.Close()
+
+	for taskRows.Next() {
+		var (
+			t            task
+			tagsJSON     string
+			commentsJSON string
+			createdAt    string
+			archived     bool
+		)
+		if err := taskRows.Scan(
+			&t.ID,
+			&t.Title,
+			&t.MemberID,
+			&t.Category,
+			&t.Priority,
+			&tagsJSON,
+			&commentsJSON,
+			&t.DueDate,
+			&t.Status,
+			&archived,
+			&createdAt,
+		); err != nil {
+			return state, err
+		}
+		t.Archived = archived
+		if tagsJSON != "" {
+			if err := json.Unmarshal([]byte(tagsJSON), &t.Tags); err != nil {
+				return state, err
+			}
+		}
+		if commentsJSON != "" {
+			if err := json.Unmarshal([]byte(commentsJSON), &t.Comments); err != nil {
+				return state, err
+			}
+		}
+		if createdAt != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+			if err != nil {
+				return state, err
+			}
+			t.CreatedAt = parsed
+		}
+		state.Tasks = append(state.Tasks, t)
+	}
+	return state, taskRows.Err()
+}
+
+func loadConfig(path string) (appConfig, error) {
+	cfg := defaultConfig()
+	db, err := openStorage(path)
+	if err != nil {
+		return cfg, err
+	}
+	defer db.Close()
+
+	if err := migrateLegacyFiles(db); err != nil {
+		return cfg, err
+	}
+
+	row := db.QueryRow(`SELECT value FROM config WHERE key = 'left_wheel_mode'`)
+	var value string
+	switch err := row.Scan(&value); {
+	case errors.Is(err, sql.ErrNoRows):
+		return cfg, saveConfig(path, cfg)
+	case err != nil:
+		return cfg, err
+	default:
+		cfg.LeftWheelMode = value
+	}
+	if cfg.leftWheelMode() == "" {
+		cfg.LeftWheelMode = defaultConfig().LeftWheelMode
+	}
+	return cfg, nil
+}
+
+func saveConfig(path string, cfg appConfig) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec(
+		`INSERT INTO config (key, value) VALUES ('left_wheel_mode', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		cfg.leftWheelMode(),
+	)
+	return err
+}
+
+func saveState(path string, state appState) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := replaceState(tx, state); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func openStorage(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS members (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			email TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			member_id TEXT NOT NULL,
+			category TEXT NOT NULL,
+			priority TEXT NOT NULL,
+			tags_json TEXT NOT NULL,
+			comments_json TEXT NOT NULL,
+			due_date TEXT NOT NULL,
+			status TEXT NOT NULL,
+			archived INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS config (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func migrateLegacyFiles(db *sql.DB) error {
+	empty, err := storageIsEmpty(db)
+	if err != nil || !empty {
+		return err
+	}
+
+	statePath := filepath.Join(".", legacyStateFile)
+	configPath := filepath.Join(".", legacyConfigFile)
+
+	if _, err := os.Stat(statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Stat(configPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	if !fileExists(statePath) && !fileExists(configPath) {
+		return nil
+	}
+
+	state, err := loadLegacyState(statePath)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadLegacyConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := replaceState(tx, state); err != nil {
+		return err
+	}
+	if err := replaceConfig(tx, cfg); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func storageIsEmpty(db *sql.DB) (bool, error) {
+	var count int
+	if err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM members) +
+		(SELECT COUNT(*) FROM tasks) +
+		(SELECT COUNT(*) FROM config)`).Scan(&count); err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
+func replaceState(tx *sql.Tx, state appState) error {
+	if _, err := tx.Exec(`DELETE FROM members`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM tasks`); err != nil {
+		return err
+	}
+
+	for _, mem := range state.Members {
+		if _, err := tx.Exec(
+			`INSERT INTO members (id, name, role, email) VALUES (?, ?, ?, ?)`,
+			mem.ID, mem.Name, mem.Role, mem.Email,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, t := range state.Tasks {
+		tagsJSON, err := json.Marshal(t.Tags)
+		if err != nil {
+			return err
+		}
+		commentsJSON, err := json.Marshal(t.Comments)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO tasks (
+				id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			t.ID,
+			t.Title,
+			t.MemberID,
+			t.Category,
+			t.Priority,
+			string(tagsJSON),
+			string(commentsJSON),
+			t.DueDate,
+			t.Status,
+			t.Archived,
+			t.CreatedAt.Format(time.RFC3339Nano),
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func replaceConfig(tx *sql.Tx, cfg appConfig) error {
+	if _, err := tx.Exec(`DELETE FROM config`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`INSERT INTO config (key, value) VALUES ('left_wheel_mode', ?)`, cfg.leftWheelMode())
+	return err
+}
+
+func loadLegacyState(path string) (appState, error) {
 	var state appState
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -2466,11 +2763,11 @@ func loadState(path string) (appState, error) {
 	return state, err
 }
 
-func loadConfig(path string) (appConfig, error) {
+func loadLegacyConfig(path string) (appConfig, error) {
 	cfg := defaultConfig()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return cfg, saveConfig(path, cfg)
+		return cfg, nil
 	}
 	if err != nil {
 		return cfg, err
@@ -2487,20 +2784,9 @@ func loadConfig(path string) (appConfig, error) {
 	return cfg, nil
 }
 
-func saveConfig(path string, cfg appConfig) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o644)
-}
-
-func saveState(path string, state appState) error {
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o644)
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func normalizeDueInput(raw string) (string, error) {
@@ -2707,8 +2993,8 @@ func helpManual(width int) string {
 		"Task form and filter fields also accept: tomorrow, next friday, in 3 days, Mar 20.",
 		"",
 		"Data",
-		"Everything is stored locally in promag-data.json in this project directory.",
-		"Behavior settings live in promag-config.json.",
+		"Everything is stored locally in promag.sqlite3 in this project directory.",
+		"Legacy promag-data.json and promag-config.json are imported automatically when present.",
 		"Use s to open settings in-app.",
 		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",
 		"Due dates use YYYY-MM-DD.",

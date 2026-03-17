@@ -1,6 +1,6 @@
 # ProMag
 
-ProMag is a Bubble Tea-based project management TUI written in Go. It is built for keyboard-first task tracking, but also supports mouse interaction, local JSON persistence, archive workflows, and batch task capture.
+ProMag is a Bubble Tea-based project management TUI written in Go. It is built for keyboard-first task tracking, but also supports mouse interaction, local SQLite persistence, archive workflows, and batch task capture.
 
 ## What It Does
 
@@ -9,7 +9,7 @@ ProMag is a Bubble Tea-based project management TUI written in Go. It is built f
 - Track task status, due dates, comments, tags, priority, and assignees
 - Archive completed tasks without deleting them
 - Capture multiple tasks quickly from plain-text notes
-- Persist board state locally in JSON files
+- Persist board state locally in a SQLite database file
 
 ## Requirements
 
@@ -24,10 +24,8 @@ Run the app from the project root:
 go run .
 ```
 
-This creates and uses:
-
-- `promag-data.json` for tasks and members
-- `promag-config.json` for UI behavior settings
+This creates and uses `promag.sqlite3` for tasks, members, and UI behavior settings.
+If legacy `promag-data.json` or `promag-config.json` files are present, they are imported automatically on first run.
 
 ## Build And Install
 
@@ -67,7 +65,7 @@ go run . --debug --debug-hitboxes
 
 ## Configuration
 
-Behavior settings are stored in [`promag-config.json`](/mnt/data/workspace/Go/promag/promag-config.json).
+Behavior settings are stored in `promag.sqlite3`.
 
 Current settings:
 
@@ -78,7 +76,7 @@ Current settings:
 You can change settings in either of these ways:
 
 1. In-app: press `s`, use `up` / `down` or `tab` / `shift+tab`, then press `enter` or `ctrl+s`
-2. Manually: edit `promag-config.json`
+2. Manually: inspect or edit the `config` table in `promag.sqlite3`
 
 ## Controls
 
@@ -160,10 +158,10 @@ Task and filter forms also accept natural-language dates such as `tomorrow`, `ne
 
 ## Data Files
 
-- `promag-data.json`
-  - Stores members and tasks
-- `promag-config.json`
-  - Stores UI and interaction settings
+- `promag.sqlite3`
+  - Stores members, tasks, and UI settings
+- Legacy `promag-data.json` / `promag-config.json`
+  - Imported automatically if they still exist when the app first opens the SQLite database
 
 Due dates are stored as `YYYY-MM-DD`.
 
