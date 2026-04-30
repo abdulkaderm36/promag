@@ -108,6 +108,23 @@ type appState struct {
 
 type appConfig struct {
 	LeftWheelMode string `json:"left_wheel_mode"`
+	TaskSortMode  string `json:"task_sort_mode"`
+}
+
+type taskSortMode string
+
+const (
+	taskSortDue      taskSortMode = "due"
+	taskSortPriority taskSortMode = "priority"
+	taskSortTitle    taskSortMode = "title"
+	taskSortCreated  taskSortMode = "created"
+)
+
+var taskSortModes = []taskSortMode{
+	taskSortDue,
+	taskSortPriority,
+	taskSortTitle,
+	taskSortCreated,
 }
 
 type projectRecord struct {
@@ -123,6 +140,7 @@ type projectRecord struct {
 func defaultConfig() appConfig {
 	return appConfig{
 		LeftWheelMode: "scroll_list",
+		TaskSortMode:  string(taskSortDue),
 	}
 }
 
@@ -133,6 +151,37 @@ func (c appConfig) leftWheelMode() string {
 		return mode
 	default:
 		return defaultConfig().LeftWheelMode
+	}
+}
+
+func (c appConfig) taskSortMode() taskSortMode {
+	mode := taskSortMode(strings.TrimSpace(strings.ToLower(c.TaskSortMode)))
+	switch mode {
+	case taskSortDue, taskSortPriority, taskSortTitle, taskSortCreated:
+		return mode
+	default:
+		return defaultConfig().taskSortMode()
+	}
+}
+
+func nextTaskSortMode(mode taskSortMode) taskSortMode {
+	idx := slices.Index(taskSortModes, mode)
+	if idx == -1 {
+		return taskSortModes[0]
+	}
+	return taskSortModes[(idx+1)%len(taskSortModes)]
+}
+
+func taskSortLabel(mode taskSortMode) string {
+	switch mode {
+	case taskSortPriority:
+		return "priority"
+	case taskSortTitle:
+		return "title"
+	case taskSortCreated:
+		return "newest"
+	default:
+		return "due date"
 	}
 }
 
@@ -699,6 +748,8 @@ func (m model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p":
 		m.openProjectSwitcher()
 		return m, nil
+	case "o":
+		return m.cycleTaskSort(), nil
 	case "s":
 		m.openSettings()
 		return m, nil
@@ -896,11 +947,18 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.closeOverlay("Settings cancelled.")
 		return m, nil
 	case "up", "down", "tab", "shift+tab", "ctrl+j", "ctrl+k":
-		if m.config.leftWheelMode() == "scroll_list" {
-			m.config.LeftWheelMode = "move_selection"
-		} else {
-			m.config.LeftWheelMode = "scroll_list"
+		m.navigateForm(2, msg.String())
+		return m, nil
+	case "left", "right", " ", "o":
+		if m.formCursor == 0 {
+			if m.config.leftWheelMode() == "scroll_list" {
+				m.config.LeftWheelMode = "move_selection"
+			} else {
+				m.config.LeftWheelMode = "scroll_list"
+			}
+			return m, nil
 		}
+		m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
 		return m, nil
 	case "enter", "ctrl+s":
 		if err := saveConfig(m.dbPath, m.config); err != nil {
@@ -1047,6 +1105,9 @@ func (m model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.closeOverlay("")
 		m.openFilterForm()
 		return m, nil
+	case "o":
+		m.closeOverlay("")
+		return m.cycleTaskSort(), nil
 	case "s":
 		m.closeOverlay("")
 		m.openSettings()
@@ -1348,6 +1409,7 @@ func (m model) renderOverlay() string {
 			"  n   Quick Note Capture",
 			"  p   Projects",
 			"  f   Filters",
+			"  o   Cycle Task Sort",
 			"  s   Settings",
 			"  z   Archive Completed Task",
 			"  r   Restore Archived Task",
@@ -1412,6 +1474,7 @@ func (m model) renderOverlay() string {
 		mode := m.config.leftWheelMode()
 		scrollList := ui.subtitle.Render("scroll_list")
 		moveSelection := ui.subtitle.Render("move_selection")
+		sortMode := m.config.taskSortMode()
 		if mode == "scroll_list" {
 			scrollList = ui.eyebrow.Render("scroll_list")
 		}
@@ -1420,14 +1483,21 @@ func (m model) renderOverlay() string {
 		}
 		lines := []string{
 			ui.sectionTitle.Render("Settings"),
-			ui.subtitle.Render("up/down or tab toggles. enter or ctrl+s saves. esc cancels."),
+			ui.subtitle.Render("up/down or tab moves. left/right/space changes. enter or ctrl+s saves. esc cancels."),
 			"",
-			ui.inputLabelFocus.Render("Left wheel behavior"),
+			m.formLabel("Left wheel behavior", m.formCursor == 0),
 			"  " + scrollList,
 			"  " + moveSelection,
 			"",
+			m.formLabel("Task sort", m.formCursor == 1),
+			"  " + taskSortOption(taskSortDue, sortMode),
+			"  " + taskSortOption(taskSortPriority, sortMode),
+			"  " + taskSortOption(taskSortTitle, sortMode),
+			"  " + taskSortOption(taskSortCreated, sortMode),
+			"",
 			ui.subtitle.Render("scroll_list keeps the selected task pinned while the list viewport moves."),
 			ui.subtitle.Render("move_selection makes the wheel move the selected row directly."),
+			ui.subtitle.Render("Task sort always keeps open tasks before completed tasks."),
 		}
 		return bg.Render(strings.Join(lines, "\n"))
 	case overlayProjects:
@@ -1889,6 +1959,9 @@ func (m *model) navigateForm(total int, direction string) {
 			m.noteInputs[i].Blur()
 		}
 		m.noteInput.Blur()
+	}
+	if m.overlay == overlaySettings {
+		// Settings rows are rendered directly, so there are no inputs to blur.
 	}
 	if m.overlay == overlayProjects {
 		for i := range m.projectInputs {
@@ -2367,6 +2440,20 @@ func (m model) deleteSelected() model {
 	return m
 }
 
+func (m model) cycleTaskSort() model {
+	m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
+	if err := saveConfig(m.dbPath, m.config); err != nil {
+		m.setStatus("save failed: " + err.Error())
+		return m
+	}
+	m.cursor[viewTasks] = 0
+	m.cursor[viewArchive] = 0
+	m.listOffset[viewTasks] = 0
+	m.listOffset[viewArchive] = 0
+	m.setStatus(fmt.Sprintf("Task sort: %s. Open tasks shown first.", taskSortLabel(m.config.taskSortMode())))
+	return m
+}
+
 func (m model) selectedTask() *task {
 	if m.activeView != viewTasks && m.activeView != viewArchive {
 		return nil
@@ -2514,7 +2601,7 @@ func (m model) dateDetail() string {
 func (m model) listHint() string {
 	switch m.activeView {
 	case viewTasks:
-		return "j/k move • space mark done • z archive done task • t add task • n quick notes • f filter • p projects"
+		return fmt.Sprintf("j/k move • sort %s (o) • space done • z archive done • t add • f filter", taskSortLabel(m.config.taskSortMode()))
 	case viewMembers:
 		return "j/k move • m add member • t add task for selected member • f filter • p projects"
 	case viewDates:
@@ -2684,24 +2771,78 @@ func (m model) filteredMemberTaskCounts(memberID string) (open int, done int) {
 
 func (m model) sortedTasks() []task {
 	tasks := slices.Clone(m.state.Tasks)
+	mode := m.config.taskSortMode()
 	sort.Slice(tasks, func(i, j int) bool {
 		left, right := tasks[i], tasks[j]
-		if left.Status != right.Status {
-			return left.Status < right.Status
+		if statusRank(left.Status) != statusRank(right.Status) {
+			return statusRank(left.Status) < statusRank(right.Status)
 		}
-		ld := sortableDue(left.DueDate)
-		rd := sortableDue(right.DueDate)
-		if !ld.Equal(rd) {
-			return ld.Before(rd)
+		if taskLessByMode(left, right, mode) {
+			return true
 		}
+		if taskLessByMode(right, left, mode) {
+			return false
+		}
+		return taskTieBreak(left, right)
+	})
+	return tasks
+}
+
+func taskLessByMode(left, right task, mode taskSortMode) bool {
+	switch mode {
+	case taskSortPriority:
 		lp := priorityRank(left.Priority)
 		rp := priorityRank(right.Priority)
 		if lp != rp {
 			return lp > rp
 		}
-		return strings.ToLower(left.Title) < strings.ToLower(right.Title)
-	})
-	return tasks
+	case taskSortTitle:
+		lt := strings.ToLower(strings.TrimSpace(left.Title))
+		rt := strings.ToLower(strings.TrimSpace(right.Title))
+		if lt != rt {
+			return lt < rt
+		}
+	case taskSortCreated:
+		if !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.After(right.CreatedAt)
+		}
+	default:
+		ld := sortableDue(left.DueDate)
+		rd := sortableDue(right.DueDate)
+		if !ld.Equal(rd) {
+			return ld.Before(rd)
+		}
+	}
+	return false
+}
+
+func taskTieBreak(left, right task) bool {
+	ld := sortableDue(left.DueDate)
+	rd := sortableDue(right.DueDate)
+	if !ld.Equal(rd) {
+		return ld.Before(rd)
+	}
+	lp := priorityRank(left.Priority)
+	rp := priorityRank(right.Priority)
+	if lp != rp {
+		return lp > rp
+	}
+	lt := strings.ToLower(strings.TrimSpace(left.Title))
+	rt := strings.ToLower(strings.TrimSpace(right.Title))
+	if lt != rt {
+		return lt < rt
+	}
+	if !left.CreatedAt.Equal(right.CreatedAt) {
+		return left.CreatedAt.After(right.CreatedAt)
+	}
+	return left.ID < right.ID
+}
+
+func statusRank(status string) int {
+	if strings.EqualFold(strings.TrimSpace(status), "done") {
+		return 1
+	}
+	return 0
 }
 
 func (m model) archivedTasks() []task {
@@ -2944,18 +3085,33 @@ func loadConfig(path string) (appConfig, error) {
 		return cfg, err
 	}
 
-	row := db.QueryRow(`SELECT value FROM config WHERE key = 'left_wheel_mode'`)
-	var value string
-	switch err := row.Scan(&value); {
-	case errors.Is(err, sql.ErrNoRows):
-		return cfg, saveConfig(path, cfg)
-	case err != nil:
+	rows, err := db.Query(`SELECT key, value FROM config WHERE key IN ('left_wheel_mode', 'task_sort_mode')`)
+	if err != nil {
 		return cfg, err
-	default:
-		cfg.LeftWheelMode = value
 	}
-	if cfg.leftWheelMode() == "" {
-		cfg.LeftWheelMode = defaultConfig().LeftWheelMode
+	defer rows.Close()
+
+	seen := map[string]bool{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return cfg, err
+		}
+		seen[key] = true
+		switch key {
+		case "left_wheel_mode":
+			cfg.LeftWheelMode = value
+		case "task_sort_mode":
+			cfg.TaskSortMode = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return cfg, err
+	}
+	if cfg.leftWheelMode() != cfg.LeftWheelMode || cfg.taskSortMode() != taskSortMode(cfg.TaskSortMode) || !seen["left_wheel_mode"] || !seen["task_sort_mode"] {
+		cfg.LeftWheelMode = cfg.leftWheelMode()
+		cfg.TaskSortMode = string(cfg.taskSortMode())
+		return cfg, saveConfig(path, cfg)
 	}
 	return cfg, nil
 }
@@ -2967,12 +3123,19 @@ func saveConfig(path string, cfg appConfig) error {
 	}
 	defer db.Close()
 
-	_, err = db.Exec(
-		`INSERT INTO config (key, value) VALUES ('left_wheel_mode', ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		cfg.leftWheelMode(),
-	)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := upsertConfig(tx, "left_wheel_mode", cfg.leftWheelMode()); err != nil {
+		return err
+	}
+	if err := upsertConfig(tx, "task_sort_mode", string(cfg.taskSortMode())); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func saveState(path string, state appState) error {
@@ -3143,7 +3306,19 @@ func replaceConfig(tx *sql.Tx, cfg appConfig) error {
 	if _, err := tx.Exec(`DELETE FROM config`); err != nil {
 		return err
 	}
-	_, err := tx.Exec(`INSERT INTO config (key, value) VALUES ('left_wheel_mode', ?)`, cfg.leftWheelMode())
+	if err := upsertConfig(tx, "left_wheel_mode", cfg.leftWheelMode()); err != nil {
+		return err
+	}
+	return upsertConfig(tx, "task_sort_mode", string(cfg.taskSortMode()))
+}
+
+func upsertConfig(tx *sql.Tx, key, value string) error {
+	_, err := tx.Exec(
+		`INSERT INTO config (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key,
+		value,
+	)
 	return err
 }
 
@@ -3178,9 +3353,8 @@ func loadLegacyConfig(path string) (appConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
 	}
-	if cfg.leftWheelMode() == "" {
-		cfg.LeftWheelMode = defaultConfig().LeftWheelMode
-	}
+	cfg.LeftWheelMode = cfg.leftWheelMode()
+	cfg.TaskSortMode = string(cfg.taskSortMode())
 	return cfg, nil
 }
 
@@ -3679,6 +3853,7 @@ func manualKeybindTable(width int) string {
 		{"m", "Open member form"},
 		{"p", "Open project switcher / create project"},
 		{"s", "Open settings"},
+		{"o", "Cycle task sort: due date, priority, title, newest"},
 		{"e", "Edit selected task or member"},
 		{"t", "Open task form"},
 		{"a", "Context-aware add action"},
@@ -3999,6 +4174,17 @@ func priorityPill(priority string) string {
 		Padding(0, 1).
 		Foreground(ui.text)
 	return style.Render(lipgloss.JoinHorizontal(lipgloss.Center, icon, " ", label))
+}
+
+func taskSortOption(mode, current taskSortMode) string {
+	label := string(mode)
+	if mode == taskSortCreated {
+		label = "newest"
+	}
+	if mode == current {
+		return ui.eyebrow.Render(label)
+	}
+	return ui.subtitle.Render(label)
 }
 
 func memberBadge(name string) string {

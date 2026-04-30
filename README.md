@@ -77,6 +77,11 @@ Current settings:
 - `left_wheel_mode`
   - `scroll_list`: mouse wheel scrolls the left list viewport without changing the selected task
   - `move_selection`: mouse wheel moves the selected row directly
+- `task_sort_mode`
+  - `due`: open tasks first, then completed tasks, ordered by due date
+  - `priority`: open tasks first, then completed tasks, ordered by priority
+  - `title`: open tasks first, then completed tasks, ordered by title
+  - `created`: open tasks first, then completed tasks, ordered by newest task
 
 You can change settings in either of these ways:
 
@@ -98,6 +103,7 @@ You can change settings in either of these ways:
 - `mouse wheel`: scroll the active pane
 - `left click`: select a tab or row
 - `M`: toggle app mouse capture vs terminal text selection
+- `o`: cycle task sort mode
 
 ### Actions
 
