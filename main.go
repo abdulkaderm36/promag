@@ -34,6 +34,7 @@ const (
 	legacyStateFile   = "promag-data.json"
 	legacyConfigFile  = "promag-config.json"
 	minLeftWidth      = 40
+	defaultDueDays    = 7
 )
 
 var naturalDateParser = when.EN
@@ -1813,9 +1814,10 @@ func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 	if defaultMembers != "" {
 		m.taskInputs[1].SetValue(defaultMembers)
 	}
-	if defaultDueDate != "" {
-		m.taskInputs[5].SetValue(defaultDueDate)
+	if defaultDueDate == "" {
+		defaultDueDate = defaultTaskDueDate()
 	}
+	m.taskInputs[5].SetValue(defaultDueDate)
 	m.refreshMemberSuggestions()
 	m.taskInputs[0].Focus()
 }
@@ -1829,6 +1831,9 @@ func (m *model) openNoteForm() {
 		m.noteInputs[i].Blur()
 	}
 	m.noteInputs[0].SetValue(defaultMember)
+	if defaultDueDate == "" {
+		defaultDueDate = defaultTaskDueDate()
+	}
 	m.noteInputs[1].SetValue(defaultDueDate)
 	m.noteInput.SetValue("")
 	m.noteInput.Blur()
@@ -2151,6 +2156,10 @@ func (m model) noteBatchInput() (string, error) {
 		lines = append(lines, body)
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+func defaultTaskDueDate() string {
+	return time.Now().AddDate(0, 0, defaultDueDays).Format(dateLayout)
 }
 
 func (m *model) submitFilterForm() error {
@@ -3833,7 +3842,7 @@ func helpManual(width int) string {
 		"Legacy promag.sqlite3, promag-data.json, and promag-config.json are imported automatically when present.",
 		"Use s to open settings in-app.",
 		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",
-		"Due dates use YYYY-MM-DD.",
+		"Due dates use YYYY-MM-DD. New task and quick note forms default to 7 days from today.",
 		"Task form supports comma-separated members and will create one task per member.",
 		"Mouse: click tabs or list rows, wheel to scroll.",
 	}, "\n")

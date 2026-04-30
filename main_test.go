@@ -80,6 +80,28 @@ func TestLoadConfigAddsDefaultTaskSortMode(t *testing.T) {
 	}
 }
 
+func TestOpenTaskFormDefaultsDueDateSevenDaysOut(t *testing.T) {
+	m := newModel("", "", projectRecord{}, nil, appState{}, defaultConfig())
+
+	m.openTaskForm("", "")
+
+	want := defaultTaskDueDate()
+	if got := m.taskInputs[5].Value(); got != want {
+		t.Fatalf("task form due date = %q, want %q", got, want)
+	}
+}
+
+func TestOpenNoteFormDefaultsDueDateSevenDaysOut(t *testing.T) {
+	m := newModel("", "", projectRecord{}, nil, appState{}, defaultConfig())
+
+	m.openNoteForm()
+
+	want := defaultTaskDueDate()
+	if got := m.noteInputs[1].Value(); got != want {
+		t.Fatalf("note form due date = %q, want %q", got, want)
+	}
+}
+
 func taskIDs(tasks []task) []string {
 	ids := make([]string, 0, len(tasks))
 	for _, task := range tasks {

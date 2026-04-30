@@ -166,7 +166,7 @@ tags:api,release
 - Review deploy checklist @Ali #ops !urgent
 ```
 
-Task and filter forms also accept natural-language dates such as `tomorrow`, `next friday`, `in 3 days`, and `Mar 20`.
+New task and quick note forms default the due date to 7 days from today. Task and filter forms also accept natural-language dates such as `tomorrow`, `next friday`, `in 3 days`, and `Mar 20`.
 
 ## Data Files
 
@@ -177,7 +177,7 @@ Task and filter forms also accept natural-language dates such as `tomorrow`, `ne
 - Legacy `promag.sqlite3` / `promag-data.json` / `promag-config.json`
   - Imported automatically into a default project if they still exist on first run
 
-Due dates are stored as `YYYY-MM-DD`.
+Due dates are stored as `YYYY-MM-DD`. New tasks default to a due date 7 days from the creation date unless you change or clear the due date field.
 
 ## Developer Workflow
 
