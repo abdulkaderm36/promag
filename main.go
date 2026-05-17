@@ -26,6 +26,7 @@ import (
 
 const (
 	appTitle          = "ProMag"
+	exportVersion     = 1
 	dateLayout        = "2006-01-02"
 	storageDir        = ".promag"
 	registryFile      = "registry.sqlite3"
@@ -136,6 +137,23 @@ type projectRecord struct {
 	DBPath       string
 	CreatedAt    time.Time
 	LastOpenedAt time.Time
+}
+
+type projectExportBundle struct {
+	Version    int                   `json:"version"`
+	ExportedAt time.Time             `json:"exported_at"`
+	Project    exportedProjectRecord `json:"project"`
+	Config     appConfig             `json:"config"`
+	State      appState              `json:"state"`
+}
+
+type exportedProjectRecord struct {
+	ID           string      `json:"id"`
+	Name         string      `json:"name"`
+	Type         projectType `json:"type"`
+	RemoteURL    string      `json:"remote_url"`
+	CreatedAt    time.Time   `json:"created_at"`
+	LastOpenedAt time.Time   `json:"last_opened_at"`
 }
 
 func defaultConfig() appConfig {
@@ -366,6 +384,8 @@ func newTheme() theme {
 func main() {
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	debugHitboxesFlag := flag.Bool("debug-hitboxes", false, "draw mouse hit zones on screen")
+	exportFlag := flag.Bool("export", false, "export a project to JSON: --export <project-id-or-name> <output-path.json>")
+	importFlag := flag.Bool("import", false, "import JSON as a new local project: --import <project-name> <input-path.json>")
 	flag.Parse()
 
 	mouseDebugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_MOUSE"))
@@ -385,6 +405,38 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bootstrap project registry: %v\n", err)
 		os.Exit(1)
+	}
+	if *exportFlag && *importFlag {
+		fmt.Fprintln(os.Stderr, "--export and --import cannot be used together")
+		os.Exit(1)
+	}
+	if *exportFlag {
+		args := flag.Args()
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: promag --export <project-id-or-name> <output-path.json>")
+			os.Exit(1)
+		}
+		project, err := exportProjectBundle(projects, lastProjectID, args[0], args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "export project: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "Exported project %q to %s\n", project.Name, args[1])
+		return
+	}
+	if *importFlag {
+		args := flag.Args()
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: promag --import <project-name> <input-path.json>")
+			os.Exit(1)
+		}
+		project, err := importProjectBundle(registryPath, projectsBaseDir, projects, args[1], args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "import project: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "Imported project %q\n", project.Name)
+		return
 	}
 
 	var (
@@ -3486,6 +3538,162 @@ func chooseActiveProject(projects []projectRecord, lastProjectID string) (projec
 	return projects[0], true
 }
 
+func exportProjectBundle(projects []projectRecord, lastProjectID, selector, outputPath string) (projectRecord, error) {
+	project, err := selectProjectForExport(projects, lastProjectID, selector)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	state, err := loadState(project.DBPath)
+	if err != nil {
+		return projectRecord{}, fmt.Errorf("load project state: %w", err)
+	}
+	cfg, err := loadConfig(project.DBPath)
+	if err != nil {
+		return projectRecord{}, fmt.Errorf("load project config: %w", err)
+	}
+
+	bundle := projectExportBundle{
+		Version:    exportVersion,
+		ExportedAt: time.Now(),
+		Project: exportedProjectRecord{
+			ID:           project.ID,
+			Name:         project.Name,
+			Type:         project.Type,
+			RemoteURL:    project.RemoteURL,
+			CreatedAt:    project.CreatedAt,
+			LastOpenedAt: project.LastOpenedAt,
+		},
+		Config: cfg,
+		State:  state,
+	}
+	if err := writeProjectExport(outputPath, bundle); err != nil {
+		return projectRecord{}, err
+	}
+	return project, nil
+}
+
+func importProjectBundle(registryPath, projectsBaseDir string, projects []projectRecord, inputPath, importName string) (projectRecord, error) {
+	bundle, err := readProjectExport(inputPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	if bundle.Version != exportVersion {
+		return projectRecord{}, fmt.Errorf("unsupported export version %d", bundle.Version)
+	}
+
+	name := strings.TrimSpace(importName)
+	if name == "" {
+		name = uniqueImportedProjectName(projects, bundle.Project.Name)
+	}
+
+	project, err := createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
+	if err != nil {
+		return projectRecord{}, err
+	}
+	if err := saveState(project.DBPath, bundle.State); err != nil {
+		return projectRecord{}, fmt.Errorf("save imported state: %w", err)
+	}
+	cfg := bundle.Config
+	cfg.LeftWheelMode = cfg.leftWheelMode()
+	cfg.TaskSortMode = string(cfg.taskSortMode())
+	if err := saveConfig(project.DBPath, cfg); err != nil {
+		return projectRecord{}, fmt.Errorf("save imported config: %w", err)
+	}
+	return project, nil
+}
+
+func selectProjectForExport(projects []projectRecord, lastProjectID, selector string) (projectRecord, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		if project, ok := chooseActiveProject(projects, lastProjectID); ok {
+			return project, nil
+		}
+		return projectRecord{}, errors.New("no project to export")
+	}
+
+	for _, project := range projects {
+		if project.ID == selector {
+			return project, nil
+		}
+	}
+
+	var matches []projectRecord
+	for _, project := range projects {
+		if strings.EqualFold(project.Name, selector) {
+			matches = append(matches, project)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return projectRecord{}, fmt.Errorf("project %q was not found", selector)
+	default:
+		return projectRecord{}, fmt.Errorf("project name %q is ambiguous; use the project ID", selector)
+	}
+}
+
+func writeProjectExport(path string, bundle projectExportBundle) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("export path is required")
+	}
+	data, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func readProjectExport(path string) (projectExportBundle, error) {
+	if strings.TrimSpace(path) == "" {
+		return projectExportBundle{}, errors.New("import path is required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return projectExportBundle{}, err
+	}
+	var bundle projectExportBundle
+	if err := json.Unmarshal(data, &bundle); err != nil {
+		return projectExportBundle{}, err
+	}
+	return bundle, nil
+}
+
+func uniqueImportedProjectName(projects []projectRecord, base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "Imported Project"
+	}
+	if !projectNameExists(projects, base) {
+		return base
+	}
+	name := base + " (imported)"
+	if !projectNameExists(projects, name) {
+		return name
+	}
+	for i := 2; ; i++ {
+		name = fmt.Sprintf("%s (imported %d)", base, i)
+		if !projectNameExists(projects, name) {
+			return name
+		}
+	}
+}
+
+func projectNameExists(projects []projectRecord, name string) bool {
+	for _, project := range projects {
+		if strings.EqualFold(project.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func createProjectRecord(registryPath, projectsBaseDir, name string, kind projectType, remoteURL string) (projectRecord, error) {
 	if err := os.MkdirAll(projectsBaseDir, 0o755); err != nil {
 		return projectRecord{}, err
@@ -3839,6 +4047,8 @@ func helpManual(width int) string {
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",
+		"Exported project backups are JSON files; use a .json filename, for example backups/ops.json.",
+		"CLI export/import: promag --export Ops backups/ops.json and promag --import \"Restored Ops\" backups/ops.json.",
 		"Legacy promag.sqlite3, promag-data.json, and promag-config.json are imported automatically when present.",
 		"Use s to open settings in-app.",
 		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",

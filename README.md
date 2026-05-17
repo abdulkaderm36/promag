@@ -59,6 +59,10 @@ promag
   - Enables mouse debug logging to `/tmp/promag-mouse.log` unless `PROMAG_DEBUG_MOUSE` is set
 - `--debug-hitboxes`
   - Opens the lightweight on-screen mouse hitbox debug panel
+- `--export <project-id-or-name> <path.json>`
+  - Exports a project to a portable JSON file
+- `--import <project-name> <path.json>`
+  - Imports a project JSON file as a new local project with the given name
 
 Examples:
 
@@ -66,6 +70,8 @@ Examples:
 go run . --debug
 go run . --debug-hitboxes
 go run . --debug --debug-hitboxes
+go run . --export Ops backups/ops.json
+go run . --import "Restored Project" backups/ops.json
 ```
 
 ## Configuration
@@ -174,6 +180,8 @@ New task and quick note forms default the due date to 7 days from today. Task an
   - Stores project metadata and the last-opened project
 - `.promag/projects/*.sqlite3`
   - Stores members, tasks, and UI settings for each project
+- Exported project JSON files
+  - Store project metadata, members, tasks, and settings for backup or restore into a new local project
 - Legacy `promag.sqlite3` / `promag-data.json` / `promag-config.json`
   - Imported automatically into a default project if they still exist on first run
 
