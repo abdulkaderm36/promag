@@ -29,22 +29,23 @@ import (
 )
 
 const (
-	appTitle          = "ProMag"
-	exportVersion     = 1
-	storageSchemaKey  = "schema_version"
-	storageSchemaVer  = 2
-	localActorID      = "local"
-	remoteTokenEnv    = "PROMAG_REMOTE_TOKEN"
-	remoteActorEnv    = "PROMAG_REMOTE_ACTOR"
-	dateLayout        = "2006-01-02"
-	storageDir        = ".promag"
-	registryFile      = "registry.sqlite3"
-	projectsDir       = "projects"
-	legacyStorageFile = "promag.sqlite3"
-	legacyStateFile   = "promag-data.json"
-	legacyConfigFile  = "promag-config.json"
-	minLeftWidth      = 40
-	defaultDueDays    = 7
+	appTitle           = "ProMag"
+	exportVersion      = 1
+	storageSchemaKey   = "schema_version"
+	storageSchemaVer   = 2
+	localActorID       = "local"
+	remoteTokenEnv     = "PROMAG_REMOTE_TOKEN"
+	remoteActorEnv     = "PROMAG_REMOTE_ACTOR"
+	remoteRefreshEvery = 5 * time.Second
+	dateLayout         = "2006-01-02"
+	storageDir         = ".promag"
+	registryFile       = "registry.sqlite3"
+	projectsDir        = "projects"
+	legacyStorageFile  = "promag.sqlite3"
+	legacyStateFile    = "promag-data.json"
+	legacyConfigFile   = "promag-config.json"
+	minLeftWidth       = 40
+	defaultDueDays     = 7
 )
 
 var naturalDateParser = when.EN
@@ -667,7 +668,7 @@ func newModel(registryPath, projectsBaseDir string, project projectRecord, proje
 }
 
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, m.remoteRefreshCmd())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -684,9 +685,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleOverlayKey(msg)
 		}
 		return m.handleNormalKey(msg)
+	case remoteRefreshMsg:
+		return m.handleRemoteRefresh(msg)
 	}
 
 	return m, nil
+}
+
+func (m model) remoteRefreshCmd() tea.Cmd {
+	project := m.currentProject
+	if project.Type != projectTypeRemote || project.ID == "" {
+		return nil
+	}
+	return tea.Tick(remoteRefreshEvery, func(time.Time) tea.Msg {
+		response, err := fetchAndCacheRemoteProject(project)
+		return remoteRefreshMsg{ProjectID: project.ID, Response: response, Err: err}
+	})
+}
+
+func (m model) handleRemoteRefresh(msg remoteRefreshMsg) (tea.Model, tea.Cmd) {
+	if m.currentProject.Type != projectTypeRemote || msg.ProjectID != m.currentProject.ID {
+		return m, nil
+	}
+	next := m.remoteRefreshCmd()
+	if msg.Err != nil {
+		m.setStatus("Remote refresh failed: " + msg.Err.Error())
+		return m, next
+	}
+	m.applyRemoteState(msg.Response)
+	return m, next
+}
+
+func (m *model) applyRemoteState(response stateResponse) {
+	m.state = response.State
+	m.config = response.Config
+	m.refreshMemberSuggestions()
+	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive} {
+		m.clampViewCursor(view)
+	}
 }
 
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -1114,11 +1150,11 @@ func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if project.Type == projectTypeRemote {
-					m.closeOverlay(fmt.Sprintf("Project %q created. Remote sync is metadata-only for now.", project.Name))
+					m.closeOverlay(fmt.Sprintf("Project %q created and synced.", project.Name))
 				} else {
 					m.closeOverlay(fmt.Sprintf("Project %q created.", project.Name))
 				}
-				return m, nil
+				return m, m.remoteRefreshCmd()
 			}
 			m.closeOverlay(fmt.Sprintf("Project %q updated.", project.Name))
 			return m, nil
@@ -1172,7 +1208,7 @@ func (m model) handleProjectOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.closeOverlay(fmt.Sprintf("Switched to project %q.", project.Name))
-		return m, nil
+		return m, m.remoteRefreshCmd()
 	}
 	return m, nil
 }
@@ -3200,6 +3236,12 @@ type configWriteRequest struct {
 	Config appConfig `json:"config"`
 }
 
+type remoteRefreshMsg struct {
+	ProjectID string
+	Response  stateResponse
+	Err       error
+}
+
 type projectServer struct {
 	project projectRecord
 	token   string
@@ -3236,6 +3278,10 @@ func (s projectServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.authorized(r) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := touchCollaborator(s.project.DBPath, s.actorID(r)); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -4603,6 +4649,25 @@ func ensureCollaboratorTx(tx *sql.Tx, actorID string) error {
 	return err
 }
 
+func touchCollaborator(path, actorID string) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if err := ensureCollaboratorTx(tx, actorID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func normalizeActorID(actorID string) string {
 	if strings.TrimSpace(actorID) == "" {
 		return localActorID
@@ -5722,7 +5787,8 @@ func helpManual(width int) string {
 		"ProMag remembers the last project you opened and restores it on the next launch.",
 		"Remote projects currently store remote_url metadata and still use a local cache DB.",
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
-		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for API writes.",
+		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
+		"Active remote projects refresh server state every few seconds.",
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",

@@ -545,6 +545,52 @@ func TestRemoteProjectClientLoadsAndMutatesThroughServer(t *testing.T) {
 	}
 }
 
+func TestProjectServerTouchesCollaboratorOnRead(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Presence", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newProjectServer(project, "secret")
+
+	resp := serveJSONRequest(t, handler, http.MethodGet, "/state", nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("state status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	collaborators, err := loadCollaborators(project.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCollaborator(collaborators, "manager-1") {
+		t.Fatalf("collaborators = %#v, want manager-1 from read request", collaborators)
+	}
+}
+
+func TestHandleRemoteRefreshAppliesLatestState(t *testing.T) {
+	project := projectRecord{ID: "remote-1", Name: "Remote", Type: projectTypeRemote}
+	m := newModel("", "", project, []projectRecord{project}, appState{}, defaultConfig())
+	msg := remoteRefreshMsg{
+		ProjectID: project.ID,
+		Response: stateResponse{
+			Config: appConfig{LeftWheelMode: "scroll_list", TaskSortMode: string(taskSortTitle)},
+			State: appState{
+				Tasks: []task{{ID: "tsk-1", Title: "Refreshed", Status: "open", Priority: "medium", Version: 1}},
+			},
+		},
+	}
+
+	updated, _ := m.handleRemoteRefresh(msg)
+	got := updated.(model)
+	if len(got.state.Tasks) != 1 || got.state.Tasks[0].Title != "Refreshed" {
+		t.Fatalf("refreshed tasks = %#v", got.state.Tasks)
+	}
+	if got.config.taskSortMode() != taskSortTitle {
+		t.Fatalf("sort mode = %q, want title", got.config.taskSortMode())
+	}
+}
+
 func serveJSONRequest(t *testing.T, handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader *bytes.Reader
