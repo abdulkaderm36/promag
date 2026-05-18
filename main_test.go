@@ -556,12 +556,16 @@ func TestCloudServerCreatesListsAndScopesProjectRoutes(t *testing.T) {
 	if createResp.Code != http.StatusCreated {
 		t.Fatalf("create project status = %d body = %s", createResp.Code, createResp.Body.String())
 	}
-	var createdProject exportedProjectRecord
-	if err := json.Unmarshal(createResp.Body.Bytes(), &createdProject); err != nil {
+	var createPayload cloudProjectResponse
+	if err := json.Unmarshal(createResp.Body.Bytes(), &createPayload); err != nil {
 		t.Fatal(err)
 	}
+	createdProject := createPayload.Project
 	if createdProject.Name != "Cloud Ops" || createdProject.ID == "" {
 		t.Fatalf("created project = %#v", createdProject)
+	}
+	if createPayload.Token == "" {
+		t.Fatal("created project token is empty")
 	}
 
 	listResp := serveJSONRequest(t, handler, http.MethodGet, "/projects", nil)
@@ -597,6 +601,23 @@ func TestCloudServerCreatesListsAndScopesProjectRoutes(t *testing.T) {
 	if state.Project.ID != createdProject.ID {
 		t.Fatalf("state project ID = %q, want %q", state.Project.ID, createdProject.ID)
 	}
+
+	projectTokenHandler := newCloudServer(registryPath, projectsBaseDir, "secret")
+	projectReq := httptest.NewRequest(http.MethodGet, "/projects/"+createdProject.ID+"/state", nil)
+	projectReq.Header.Set("Authorization", "Bearer "+createPayload.Token)
+	projectResp := httptest.NewRecorder()
+	projectTokenHandler.ServeHTTP(projectResp, projectReq)
+	if projectResp.Code != http.StatusOK {
+		t.Fatalf("project token state status = %d body = %s", projectResp.Code, projectResp.Body.String())
+	}
+
+	adminReq := httptest.NewRequest(http.MethodGet, "/projects", nil)
+	adminReq.Header.Set("Authorization", "Bearer "+createPayload.Token)
+	adminResp := httptest.NewRecorder()
+	projectTokenHandler.ServeHTTP(adminResp, adminReq)
+	if adminResp.Code != http.StatusUnauthorized {
+		t.Fatalf("project token admin status = %d body = %s, want unauthorized", adminResp.Code, adminResp.Body.String())
+	}
 }
 
 func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
@@ -607,10 +628,14 @@ func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cloudProject, projectToken, err := rotateProjectAccessToken(registryPath, cloudProject.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
 	defer server.Close()
 
-	t.Setenv(remoteTokenEnv, "secret")
+	t.Setenv(remoteTokenEnv, projectToken)
 	t.Setenv(remoteActorEnv, "manager-cloud")
 
 	remoteProject := projectRecord{
@@ -663,9 +688,13 @@ func TestCloudServerImportsProjectBundle(t *testing.T) {
 	if importResp.Code != http.StatusCreated {
 		t.Fatalf("import status = %d body = %s", importResp.Code, importResp.Body.String())
 	}
-	var imported exportedProjectRecord
-	if err := json.Unmarshal(importResp.Body.Bytes(), &imported); err != nil {
+	var importPayload cloudProjectResponse
+	if err := json.Unmarshal(importResp.Body.Bytes(), &importPayload); err != nil {
 		t.Fatal(err)
+	}
+	imported := importPayload.Project
+	if importPayload.Token == "" {
+		t.Fatal("imported project token is empty")
 	}
 
 	stateResp := serveJSONRequest(t, handler, http.MethodGet, "/projects/"+imported.ID+"/state", nil)
@@ -681,6 +710,55 @@ func TestCloudServerImportsProjectBundle(t *testing.T) {
 	}
 	if state.Config.taskSortMode() != taskSortPriority {
 		t.Fatalf("imported cloud sort = %q, want priority", state.Config.taskSortMode())
+	}
+}
+
+func TestProjectRegistryAddsAccessTokenHashColumn(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	if err := os.MkdirAll(filepath.Dir(registryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE projects (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			type TEXT NOT NULL,
+			remote_url TEXT NOT NULL,
+			db_path TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_opened_at TEXT NOT NULL
+		);
+		CREATE TABLE app_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		INSERT INTO projects (id, name, type, remote_url, db_path, created_at, last_opened_at)
+		VALUES ('prj-old', 'Old Registry', 'local', '', 'old.sqlite3', '2026-05-18T12:00:00Z', '2026-05-18T12:00:00Z');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].AccessTokenHash != "" {
+		t.Fatalf("projects after registry migration = %#v", projects)
+	}
+	rotated, token, err := rotateProjectAccessToken(registryPath, "prj-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || rotated.AccessTokenHash == "" || rotated.AccessTokenHash == token {
+		t.Fatalf("rotated token/hash = token %q hash %q", token, rotated.AccessTokenHash)
 	}
 }
 

@@ -71,8 +71,10 @@ promag
   - Creates a project in the cloud data directory
 - `--cloud-import <project-name> <path.json>`
   - Imports a project JSON file into the cloud data directory
+- `--cloud-token <project-id-or-name>`
+  - Rotates and prints a cloud project access token
 - `--data-dir <path>`
-  - Data directory for `--cloud`, `--cloud-create`, and `--cloud-import`; defaults to `.promag-cloud`
+  - Data directory for `--cloud`, `--cloud-create`, `--cloud-import`, and `--cloud-token`; defaults to `.promag-cloud`
 - `--addr <host:port>`
   - Address for `--serve` or `--cloud`; defaults to `:8080`
 - `--token <token>`
@@ -91,6 +93,7 @@ go run . --import "Restored Project" backups/ops.json
 go run . --serve Ops --addr :8080 --token "$PROMAG_SERVER_TOKEN"
 go run . --cloud-create --data-dir .promag-cloud Ops
 go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
+go run . --cloud-token --data-dir .promag-cloud Ops
 go run . --cloud --addr :8080 --token "$PROMAG_SERVER_TOKEN" --data-dir .promag-cloud
 ```
 
@@ -262,21 +265,24 @@ Create or import projects into the cloud data directory:
 ```bash
 go run . --cloud-create --data-dir .promag-cloud Ops
 go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
+go run . --cloud-token --data-dir .promag-cloud Ops
 ```
+
+`--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token. Use that token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, and importing projects.
 
 Cloud API routes are project-scoped:
 
-- `GET /projects`: list cloud projects
-- `POST /projects`: create a project with `{"name":"Ops"}`
-- `POST /projects/import`: import a JSON export bundle
-- `GET /projects/{id}`: project metadata
-- `GET /projects/{id}/state`: project state, config, collaborators, and activity
-- `GET /projects/{id}/export`: project JSON export bundle
-- `POST /projects/{id}/tasks`, `PATCH /projects/{id}/tasks/{task_id}`, `DELETE /projects/{id}/tasks/{task_id}`
-- `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{member_id}`, `DELETE /projects/{id}/members/{member_id}`
-- `PATCH /projects/{id}/config`
+- `GET /projects`: list cloud projects; admin token required
+- `POST /projects`: create a project with `{"name":"Ops"}`; admin token required
+- `POST /projects/import`: import a JSON export bundle; admin token required
+- `GET /projects/{id}`: project metadata; admin or project token required
+- `GET /projects/{id}/state`: project state, config, collaborators, and activity; admin or project token required
+- `GET /projects/{id}/export`: project JSON export bundle; admin or project token required
+- `POST /projects/{id}/tasks`, `PATCH /projects/{id}/tasks/{task_id}`, `DELETE /projects/{id}/tasks/{task_id}`; admin or project token required
+- `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{member_id}`, `DELETE /projects/{id}/members/{member_id}`; admin or project token required
+- `PATCH /projects/{id}/config`; admin or project token required
 
-To connect a TUI client to a cloud project, create or edit a `remote` project and set its remote URL to `http://localhost:8080/projects/{id}`. Use the deployed host name instead of `localhost` when the hub is running on a server.
+To connect a TUI client to a cloud project, create or edit a `remote` project and set its remote URL to `http://localhost:8080/projects/{id}`. Use the deployed host name instead of `localhost` when the hub is running on a server, and set `PROMAG_REMOTE_TOKEN` to that project's token.
 
 ## Developer Workflow
 

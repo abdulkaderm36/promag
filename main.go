@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -167,13 +170,14 @@ var taskSortModes = []taskSortMode{
 }
 
 type projectRecord struct {
-	ID           string
-	Name         string
-	Type         projectType
-	RemoteURL    string
-	DBPath       string
-	CreatedAt    time.Time
-	LastOpenedAt time.Time
+	ID              string
+	Name            string
+	Type            projectType
+	RemoteURL       string
+	AccessTokenHash string
+	DBPath          string
+	CreatedAt       time.Time
+	LastOpenedAt    time.Time
 }
 
 type projectExportBundle struct {
@@ -433,7 +437,8 @@ func main() {
 	cloudFlag := flag.Bool("cloud", false, "serve all projects from a cloud data directory: --cloud --addr :8080 --token <token>")
 	cloudCreateFlag := flag.Bool("cloud-create", false, "create a cloud project: --cloud-create <project-name>")
 	cloudImportFlag := flag.Bool("cloud-import", false, "import JSON into the cloud data directory: --cloud-import <project-name> <input-path.json>")
-	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for --cloud, --cloud-create, and --cloud-import")
+	cloudTokenFlag := flag.String("cloud-token", "", "rotate and print a cloud project access token: --cloud-token <project-id-or-name>")
+	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for --cloud, --cloud-create, --cloud-import, and --cloud-token")
 	serveAddrFlag := flag.String("addr", ":8080", "address for --serve")
 	serveTokenFlag := flag.String("token", "", "bearer token for --serve or --cloud; can also use PROMAG_SERVER_TOKEN")
 	flag.Parse()
@@ -445,13 +450,13 @@ func main() {
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
 
 	cloudActionCount := 0
-	for _, active := range []bool{*cloudFlag, *cloudCreateFlag, *cloudImportFlag} {
+	for _, active := range []bool{*cloudFlag, *cloudCreateFlag, *cloudImportFlag, strings.TrimSpace(*cloudTokenFlag) != ""} {
 		if active {
 			cloudActionCount++
 		}
 	}
 	if cloudActionCount > 1 {
-		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, and --cloud-import cannot be used together")
+		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, and --cloud-token cannot be used together")
 		os.Exit(1)
 	}
 	if cloudActionCount > 0 {
@@ -477,8 +482,14 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project: %v\n", err)
 				os.Exit(1)
 			}
+			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
+				os.Exit(1)
+			}
 			fmt.Fprintf(os.Stdout, "Created cloud project %q (%s)\n", project.Name, project.ID)
 			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
 			return
 		}
 		if *cloudImportFlag {
@@ -492,8 +503,29 @@ func main() {
 				fmt.Fprintf(os.Stderr, "import cloud project: %v\n", err)
 				os.Exit(1)
 			}
+			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
+				os.Exit(1)
+			}
 			fmt.Fprintf(os.Stdout, "Imported cloud project %q (%s)\n", project.Name, project.ID)
 			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			return
+		}
+		if strings.TrimSpace(*cloudTokenFlag) != "" {
+			project, err := selectProjectForExport(projects, "", *cloudTokenFlag)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "select cloud project: %v\n", err)
+				os.Exit(1)
+			}
+			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "rotate cloud project token: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Rotated cloud project token for %q (%s)\n", project.Name, project.ID)
+			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
 			return
 		}
 		token := strings.TrimSpace(*serveTokenFlag)
@@ -3488,6 +3520,11 @@ type projectImportRequest struct {
 	Bundle projectExportBundle `json:"bundle"`
 }
 
+type cloudProjectResponse struct {
+	Project exportedProjectRecord `json:"project"`
+	Token   string                `json:"token,omitempty"`
+}
+
 func serveCloud(registryPath, projectsBaseDir, addr, token string) error {
 	if _, _, err := loadProjectRegistry(registryPath); err != nil {
 		return err
@@ -3510,17 +3547,21 @@ func (s cloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	if !authorizedToken(r, s.token) {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
 
 	path := strings.Trim(r.URL.Path, "/")
 	parts := strings.Split(path, "/")
 	switch {
 	case path == "projects":
+		if !authorizedToken(r, s.token) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
 		s.handleProjects(w, r)
 	case path == "projects/import":
+		if !authorizedToken(r, s.token) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
 		s.handleProjectImport(w, r)
 	case len(parts) >= 2 && parts[0] == "projects":
 		s.handleProjectScoped(w, r, parts[1], parts[2:])
@@ -3557,7 +3598,12 @@ func (s cloudServer) handleProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusCreated, exportProjectRecord(project))
+		project, token, err := rotateProjectAccessToken(s.registryPath, project.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), Token: token})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -3594,13 +3640,22 @@ func (s cloudServer) handleProjectImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, exportProjectRecord(project))
+	project, token, err := rotateProjectAccessToken(s.registryPath, project.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), Token: token})
 }
 
 func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request, projectID string, remainder []string) {
 	project, err := s.projectByID(projectID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !s.authorizedForProject(r, project) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if len(remainder) == 0 {
@@ -3616,7 +3671,23 @@ func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request,
 	next.URL = cloneURL(r.URL)
 	next.URL.Path = "/" + strings.Join(remainder, "/")
 	next.RequestURI = ""
+	next.Header = r.Header.Clone()
+	next.Header.Set("X-ProMag-Token", s.token)
 	newProjectServer(project, s.token).ServeHTTP(w, next)
+}
+
+func (s cloudServer) authorizedForProject(r *http.Request, project projectRecord) bool {
+	if authorizedToken(r, s.token) {
+		return true
+	}
+	if project.AccessTokenHash == "" {
+		return false
+	}
+	token := requestToken(r)
+	if token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(project.AccessTokenHash)) == 1
 }
 
 func (s cloudServer) projectByID(projectID string) (projectRecord, error) {
@@ -3707,6 +3778,11 @@ func authorizedToken(r *http.Request, expected string) bool {
 	if expected == "" {
 		return false
 	}
+	token := requestToken(r)
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+}
+
+func requestToken(r *http.Request) string {
 	token := strings.TrimSpace(r.Header.Get("X-ProMag-Token"))
 	if token == "" {
 		auth := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -3714,7 +3790,7 @@ func authorizedToken(r *http.Request, expected string) bool {
 			token = strings.TrimSpace(auth[len("bearer "):])
 		}
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+	return token
 }
 
 func (s projectServer) actorID(r *http.Request) string {
@@ -5570,7 +5646,7 @@ func loadProjectRegistry(path string) ([]projectRecord, string, error) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`SELECT id, name, type, remote_url, db_path, created_at, last_opened_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, lower(name) ASC`)
+	rows, err := db.Query(`SELECT id, name, type, remote_url, access_token_hash, db_path, created_at, last_opened_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, lower(name) ASC`)
 	if err != nil {
 		return nil, "", err
 	}
@@ -5584,7 +5660,7 @@ func loadProjectRegistry(path string) ([]projectRecord, string, error) {
 			createdAt    string
 			lastOpenedAt string
 		)
-		if err := rows.Scan(&project.ID, &project.Name, &projectTypeV, &project.RemoteURL, &project.DBPath, &createdAt, &lastOpenedAt); err != nil {
+		if err := rows.Scan(&project.ID, &project.Name, &projectTypeV, &project.RemoteURL, &project.AccessTokenHash, &project.DBPath, &createdAt, &lastOpenedAt); err != nil {
 			return nil, "", err
 		}
 		project.Type = normalizeProjectType(projectTypeV)
@@ -5780,6 +5856,45 @@ func createCloudProject(registryPath, projectsBaseDir string, projects []project
 	return createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
 }
 
+func rotateProjectAccessToken(registryPath, projectID string) (projectRecord, string, error) {
+	token, err := newAccessToken()
+	if err != nil {
+		return projectRecord{}, "", err
+	}
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, "", err
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`UPDATE projects SET access_token_hash = ? WHERE id = ?`, hashToken(token), projectID); err != nil {
+		return projectRecord{}, "", err
+	}
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, "", err
+	}
+	for _, project := range projects {
+		if project.ID == projectID {
+			return project, token, nil
+		}
+	}
+	return projectRecord{}, "", errors.New("project not found after token rotation")
+}
+
+func newAccessToken() (string, error) {
+	var raw [24]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
 func selectProjectForExport(projects []projectRecord, lastProjectID, selector string) (projectRecord, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
@@ -5971,6 +6086,7 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 			name TEXT NOT NULL,
 			type TEXT NOT NULL,
 			remote_url TEXT NOT NULL,
+			access_token_hash TEXT NOT NULL DEFAULT '',
 			db_path TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			last_opened_at TEXT NOT NULL
@@ -5983,7 +6099,23 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureProjectRegistrySchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+func ensureProjectRegistrySchema(db *sql.DB) error {
+	ok, err := columnExists(db, "projects", "access_token_hash")
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE projects ADD COLUMN access_token_hash TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 func saveLastProjectID(db *sql.DB, projectID string) error {
@@ -6225,6 +6357,7 @@ func helpManual(width int) string {
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
 		"Cloud hub mode: promag --cloud --addr :8080 --token <token> --data-dir .promag-cloud serves project-scoped APIs.",
 		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
+		"Cloud project tokens are printed once; rotate with promag --cloud-token --data-dir .promag-cloud Ops.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
 		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
 		"",
