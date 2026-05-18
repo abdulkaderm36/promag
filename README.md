@@ -70,6 +70,8 @@ promag
 - `--token <token>`
   - Bearer token for `--serve`; can also be set with `PROMAG_SERVER_TOKEN`
 
+Remote project clients use `remote_url` plus `PROMAG_REMOTE_TOKEN` for authentication. Set `PROMAG_REMOTE_ACTOR` to control the collaborator ID sent with writes.
+
 Examples:
 
 ```bash
@@ -227,6 +229,14 @@ Main API routes:
 - `PATCH /config`
 
 Write requests use optimistic versions. Send the version last seen as `expected_version`; stale writes return HTTP `409 Conflict`.
+
+To connect from another ProMag TUI instance:
+
+1. Create or edit a project with type `remote`
+2. Set the remote URL to the server, for example `http://localhost:8080`
+3. Start the TUI with `PROMAG_REMOTE_TOKEN=<token>`
+
+Remote projects load and write through the server API. A local cache database is still kept under `.promag/projects/` so the project appears in the project switcher and can reload server state when opened.
 
 ## Developer Workflow
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -33,6 +34,8 @@ const (
 	storageSchemaKey  = "schema_version"
 	storageSchemaVer  = 2
 	localActorID      = "local"
+	remoteTokenEnv    = "PROMAG_REMOTE_TOKEN"
+	remoteActorEnv    = "PROMAG_REMOTE_ACTOR"
 	dateLayout        = "2006-01-02"
 	storageDir        = ".promag"
 	registryFile      = "registry.sqlite3"
@@ -510,14 +513,9 @@ func main() {
 	)
 	if project, ok := chooseActiveProject(projects, lastProjectID); ok {
 		activeProject = project
-		state, err = loadState(project.DBPath)
+		state, cfg, err = loadProjectData(project)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "load state: %v\n", err)
-			os.Exit(1)
-		}
-		cfg, err = loadConfig(project.DBPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+			fmt.Fprintf(os.Stderr, "load project: %v\n", err)
 			os.Exit(1)
 		}
 		if err := touchProjectLastOpened(registryPath, project.ID, time.Now()); err != nil {
@@ -1078,7 +1076,7 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
 		return m, nil
 	case "enter", "ctrl+s":
-		if err := saveConfig(m.dbPath, m.config); err != nil {
+		if err := m.saveConfigRecord(m.config); err != nil {
 			m.setStatus(fmt.Sprintf("save config: %v", err))
 			return m, nil
 		}
@@ -2145,16 +2143,16 @@ func (m *model) submitMemberForm() error {
 			Role:  role,
 			Email: email,
 		}
-		if _, err := updateMember(m.dbPath, mem, m.editingMemberVer, localActorID); err != nil {
+		if _, err := m.updateMemberRecord(mem, m.editingMemberVer); err != nil {
 			return m.handleStorageError(err, "Member changed elsewhere. Reloaded latest version.")
 		}
 		return m.reloadState()
 	}
-	if _, err := createMember(m.dbPath, member{
+	if _, err := m.createMemberRecord(member{
 		Name:  name,
 		Role:  role,
 		Email: email,
-	}, localActorID); err != nil {
+	}); err != nil {
 		return err
 	}
 	return m.reloadState()
@@ -2206,7 +2204,7 @@ func (m *model) submitTaskForm() error {
 		updated.Tags = tags
 		updated.Comments = comments
 		updated.DueDate = dueDate
-		if _, err := updateTask(m.dbPath, updated, m.editingTaskVersion, localActorID); err != nil {
+		if _, err := m.updateTaskRecord(updated, m.editingTaskVersion); err != nil {
 			return m.handleStorageError(err, "Task changed elsewhere. Reloaded latest version.")
 		}
 		m.activeView = viewTasks
@@ -2214,7 +2212,7 @@ func (m *model) submitTaskForm() error {
 	}
 
 	for _, memberID := range memberIDs {
-		if _, err := createTask(m.dbPath, task{
+		if _, err := m.createTaskRecord(task{
 			Title:     title,
 			MemberID:  memberID,
 			Category:  category,
@@ -2224,7 +2222,7 @@ func (m *model) submitTaskForm() error {
 			DueDate:   dueDate,
 			Status:    "open",
 			CreatedAt: time.Now(),
-		}, localActorID); err != nil {
+		}); err != nil {
 			return err
 		}
 	}
@@ -2250,7 +2248,7 @@ func (m *model) submitNoteForm() (int, error) {
 		return 0, errors.New("quick note did not produce any tasks")
 	}
 	for _, task := range tasks {
-		if _, err := createTask(m.dbPath, task, localActorID); err != nil {
+		if _, err := m.createTaskRecord(task); err != nil {
 			return 0, err
 		}
 	}
@@ -2347,13 +2345,9 @@ func (m *model) submitProjectForm() (projectRecord, error) {
 }
 
 func (m *model) activateProject(project projectRecord) error {
-	state, err := loadState(project.DBPath)
+	state, cfg, err := loadProjectData(project)
 	if err != nil {
 		return fmt.Errorf("load project %q: %w", project.Name, err)
-	}
-	cfg, err := loadConfig(project.DBPath)
-	if err != nil {
-		return fmt.Errorf("load project config %q: %w", project.Name, err)
 	}
 	if err := touchProjectLastOpened(m.registryPath, project.ID, time.Now()); err != nil {
 		return fmt.Errorf("update last project: %w", err)
@@ -2453,7 +2447,7 @@ func (m model) toggleSelectedTask() model {
 		nextStatus = "open"
 		statusMessage = "Task reopened."
 	}
-	if err := setTaskStatus(m.dbPath, selected.ID, nextStatus, selected.Version, localActorID); err != nil {
+	if err := m.setTaskStatusRecord(selected.ID, nextStatus, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
@@ -2487,7 +2481,7 @@ func (m model) archiveSelectedTask() model {
 		m.setStatus("Only completed tasks can be archived.")
 		return m
 	}
-	if err := setTaskArchived(m.dbPath, selected.ID, true, selected.Version, localActorID); err != nil {
+	if err := m.setTaskArchivedRecord(selected.ID, true, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
@@ -2518,7 +2512,7 @@ func (m model) restoreSelectedTask() model {
 		m.setStatus("No archived task selected.")
 		return m
 	}
-	if err := setTaskArchived(m.dbPath, selected.ID, false, selected.Version, localActorID); err != nil {
+	if err := m.setTaskArchivedRecord(selected.ID, false, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
@@ -2547,7 +2541,7 @@ func (m model) deleteSelected() model {
 			m.setStatus("No task selected.")
 			return m
 		}
-		if err := deleteTask(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+		if err := m.deleteTaskRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
@@ -2570,7 +2564,7 @@ func (m model) deleteSelected() model {
 			m.setStatus("No archived task selected.")
 			return m
 		}
-		if err := deleteTask(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+		if err := m.deleteTaskRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
@@ -2598,7 +2592,7 @@ func (m model) deleteSelected() model {
 			m.setStatus("Delete member blocked: remove or reassign their tasks first.")
 			return m
 		}
-		if err := deleteMember(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+		if err := m.deleteMemberRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
@@ -2625,7 +2619,7 @@ func (m model) deleteSelected() model {
 
 func (m model) cycleTaskSort() model {
 	m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
-	if err := saveConfig(m.dbPath, m.config); err != nil {
+	if err := m.saveConfigRecord(m.config); err != nil {
 		m.setStatus("save failed: " + err.Error())
 		return m
 	}
@@ -3211,6 +3205,13 @@ type projectServer struct {
 	token   string
 }
 
+type remoteProjectClient struct {
+	baseURL string
+	token   string
+	actorID string
+	client  *http.Client
+}
+
 func serveProject(project projectRecord, addr, token string) error {
 	if _, err := loadState(project.DBPath); err != nil {
 		return err
@@ -3582,6 +3583,170 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func newRemoteProjectClient(project projectRecord) (remoteProjectClient, error) {
+	if project.Type != projectTypeRemote {
+		return remoteProjectClient{}, errors.New("project is not remote")
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(project.RemoteURL), "/")
+	if baseURL == "" {
+		return remoteProjectClient{}, errors.New("remote project URL is required")
+	}
+	token := strings.TrimSpace(os.Getenv(remoteTokenEnv))
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("PROMAG_SERVER_TOKEN"))
+	}
+	if token == "" {
+		return remoteProjectClient{}, fmt.Errorf("remote token is required: set %s or PROMAG_SERVER_TOKEN", remoteTokenEnv)
+	}
+	actorID := strings.TrimSpace(os.Getenv(remoteActorEnv))
+	if actorID == "" {
+		actorID = localCollaboratorName()
+	}
+	return remoteProjectClient{
+		baseURL: baseURL,
+		token:   token,
+		actorID: normalizeActorID(actorID),
+		client:  &http.Client{Timeout: 10 * time.Second},
+	}, nil
+}
+
+func (c remoteProjectClient) state() (stateResponse, error) {
+	var response stateResponse
+	err := c.doJSON(http.MethodGet, "/state", nil, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) createTask(t task) (task, error) {
+	var response task
+	err := c.doJSON(http.MethodPost, "/tasks", taskWriteRequest{Task: t}, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) updateTask(t task, expectedVersion int) (task, error) {
+	var response task
+	err := c.doJSON(http.MethodPatch, "/tasks/"+t.ID, taskWriteRequest{Task: t, ExpectedVersion: expectedVersion}, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) deleteTask(id string, expectedVersion int) error {
+	return c.doJSON(http.MethodDelete, "/tasks/"+id, taskWriteRequest{ExpectedVersion: expectedVersion}, nil)
+}
+
+func (c remoteProjectClient) setTaskStatus(id, status string, expectedVersion int) error {
+	return c.doJSON(http.MethodPatch, "/tasks/"+id+"/status", taskStatusRequest{Status: status, ExpectedVersion: expectedVersion}, nil)
+}
+
+func (c remoteProjectClient) setTaskArchived(id string, archived bool, expectedVersion int) error {
+	return c.doJSON(http.MethodPatch, "/tasks/"+id+"/archive", taskArchiveRequest{Archived: archived, ExpectedVersion: expectedVersion}, nil)
+}
+
+func (c remoteProjectClient) createMember(mem member) (member, error) {
+	var response member
+	err := c.doJSON(http.MethodPost, "/members", memberWriteRequest{Member: mem}, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) updateMember(mem member, expectedVersion int) (member, error) {
+	var response member
+	err := c.doJSON(http.MethodPatch, "/members/"+mem.ID, memberWriteRequest{Member: mem, ExpectedVersion: expectedVersion}, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) deleteMember(id string, expectedVersion int) error {
+	return c.doJSON(http.MethodDelete, "/members/"+id, memberWriteRequest{ExpectedVersion: expectedVersion}, nil)
+}
+
+func (c remoteProjectClient) saveConfig(cfg appConfig) (appConfig, error) {
+	var response appConfig
+	err := c.doJSON(http.MethodPatch, "/config", configWriteRequest{Config: cfg}, &response)
+	return response, err
+}
+
+func (c remoteProjectClient) doJSON(method, path string, request any, response any) error {
+	var body io.Reader
+	if request != nil {
+		data, err := json.Marshal(request)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, c.baseURL+path, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("X-ProMag-Actor", c.actorID)
+	if request != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var payload map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&payload)
+		message := payload["error"]
+		if message == "" {
+			message = resp.Status
+		}
+		if resp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", errVersionConflict, message)
+		}
+		return errors.New(message)
+	}
+	if response == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(response)
+}
+
+func loadProjectData(project projectRecord) (appState, appConfig, error) {
+	if project.Type == projectTypeRemote {
+		response, err := fetchAndCacheRemoteProject(project)
+		if err != nil {
+			return appState{}, appConfig{}, err
+		}
+		return response.State, response.Config, nil
+	}
+	state, err := loadState(project.DBPath)
+	if err != nil {
+		return appState{}, appConfig{}, err
+	}
+	cfg, err := loadConfig(project.DBPath)
+	if err != nil {
+		return appState{}, appConfig{}, err
+	}
+	return state, cfg, nil
+}
+
+func fetchAndCacheRemoteProject(project projectRecord) (stateResponse, error) {
+	client, err := newRemoteProjectClient(project)
+	if err != nil {
+		return stateResponse{}, err
+	}
+	response, err := client.state()
+	if err != nil {
+		return stateResponse{}, err
+	}
+	if err := saveState(project.DBPath, response.State); err != nil {
+		return stateResponse{}, err
+	}
+	if err := saveConfig(project.DBPath, response.Config); err != nil {
+		return stateResponse{}, err
+	}
+	if err := replaceCollaborationData(project.DBPath, response.Collaborators, response.ActivityLog); err != nil {
+		return stateResponse{}, err
+	}
+	return response, nil
+}
+
 func (m model) taskByID(id string) *task {
 	for _, t := range m.state.Tasks {
 		if t.ID == id {
@@ -3592,10 +3757,128 @@ func (m model) taskByID(id string) *task {
 	return nil
 }
 
+func (m model) remoteClient() (remoteProjectClient, error) {
+	return newRemoteProjectClient(m.currentProject)
+}
+
+func (m model) createMemberRecord(mem member) (member, error) {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return member{}, err
+		}
+		return client.createMember(mem)
+	}
+	return createMember(m.dbPath, mem, localActorID)
+}
+
+func (m model) updateMemberRecord(mem member, expectedVersion int) (member, error) {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return member{}, err
+		}
+		return client.updateMember(mem, expectedVersion)
+	}
+	return updateMember(m.dbPath, mem, expectedVersion, localActorID)
+}
+
+func (m model) deleteMemberRecord(id string, expectedVersion int) error {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return err
+		}
+		return client.deleteMember(id, expectedVersion)
+	}
+	return deleteMember(m.dbPath, id, expectedVersion, localActorID)
+}
+
+func (m model) createTaskRecord(t task) (task, error) {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return task{}, err
+		}
+		return client.createTask(t)
+	}
+	return createTask(m.dbPath, t, localActorID)
+}
+
+func (m model) updateTaskRecord(t task, expectedVersion int) (task, error) {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return task{}, err
+		}
+		return client.updateTask(t, expectedVersion)
+	}
+	return updateTask(m.dbPath, t, expectedVersion, localActorID)
+}
+
+func (m model) deleteTaskRecord(id string, expectedVersion int) error {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return err
+		}
+		return client.deleteTask(id, expectedVersion)
+	}
+	return deleteTask(m.dbPath, id, expectedVersion, localActorID)
+}
+
+func (m model) setTaskStatusRecord(id, status string, expectedVersion int) error {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return err
+		}
+		return client.setTaskStatus(id, status, expectedVersion)
+	}
+	return setTaskStatus(m.dbPath, id, status, expectedVersion, localActorID)
+}
+
+func (m model) setTaskArchivedRecord(id string, archived bool, expectedVersion int) error {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return err
+		}
+		return client.setTaskArchived(id, archived, expectedVersion)
+	}
+	return setTaskArchived(m.dbPath, id, archived, expectedVersion, localActorID)
+}
+
+func (m model) saveConfigRecord(cfg appConfig) error {
+	if m.currentProject.Type == projectTypeRemote {
+		client, err := m.remoteClient()
+		if err != nil {
+			return err
+		}
+		remoteCfg, err := client.saveConfig(cfg)
+		if err != nil {
+			return err
+		}
+		return saveConfig(m.dbPath, remoteCfg)
+	}
+	return saveConfig(m.dbPath, cfg)
+}
+
 func (m *model) reloadState() error {
-	state, err := loadState(m.dbPath)
-	if err != nil {
-		return err
+	var state appState
+	if m.currentProject.Type == projectTypeRemote {
+		response, err := fetchAndCacheRemoteProject(m.currentProject)
+		if err != nil {
+			return err
+		}
+		state = response.State
+		m.config = response.Config
+	} else {
+		loaded, err := loadState(m.dbPath)
+		if err != nil {
+			return err
+		}
+		state = loaded
 	}
 	m.state = state
 	m.refreshMemberSuggestions()
@@ -5439,6 +5722,7 @@ func helpManual(width int) string {
 		"ProMag remembers the last project you opened and restores it on the next launch.",
 		"Remote projects currently store remote_url metadata and still use a local cache DB.",
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
+		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for API writes.",
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",

@@ -489,6 +489,62 @@ func TestProjectServerRequiresAuthAndHandlesTaskConflicts(t *testing.T) {
 	}
 }
 
+func TestRemoteProjectClientLoadsAndMutatesThroughServer(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newProjectServer(serverProject, "secret"))
+	defer server.Close()
+
+	t.Setenv(remoteTokenEnv, "secret")
+	t.Setenv(remoteActorEnv, "manager-remote")
+
+	remoteProject := projectRecord{
+		ID:        "remote-1",
+		Name:      "Remote",
+		Type:      projectTypeRemote,
+		RemoteURL: server.URL,
+		DBPath:    filepath.Join(dir, "remote-cache.sqlite3"),
+	}
+	state, cfg, err := loadProjectData(remoteProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 0 {
+		t.Fatalf("initial remote tasks = %#v, want none", state.Tasks)
+	}
+	if cfg.taskSortMode() != taskSortDue {
+		t.Fatalf("remote config sort = %q, want default due", cfg.taskSortMode())
+	}
+
+	m := newModel("", "", remoteProject, []projectRecord{remoteProject}, state, cfg)
+	created, err := m.createTaskRecord(task{Title: "Remote task", Priority: "medium", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UpdatedBy != "manager-remote" {
+		t.Fatalf("created updated_by = %q, want manager-remote", created.UpdatedBy)
+	}
+	if err := m.reloadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.state.Tasks) != 1 || m.state.Tasks[0].Title != "Remote task" {
+		t.Fatalf("remote reloaded tasks = %#v", m.state.Tasks)
+	}
+
+	cached, err := loadState(remoteProject.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cached.Tasks) != 1 || cached.Tasks[0].Title != "Remote task" {
+		t.Fatalf("cached remote tasks = %#v", cached.Tasks)
+	}
+}
+
 func serveJSONRequest(t *testing.T, handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader *bytes.Reader
