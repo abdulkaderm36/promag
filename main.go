@@ -11,6 +11,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -429,8 +430,12 @@ func main() {
 	exportFlag := flag.Bool("export", false, "export a project to JSON: --export <project-id-or-name> <output-path.json>")
 	importFlag := flag.Bool("import", false, "import JSON as a new local project: --import <project-name> <input-path.json>")
 	serveProjectFlag := flag.String("serve", "", "serve a project over HTTP: --serve <project-id-or-name> --addr :8080 --token <token>")
+	cloudFlag := flag.Bool("cloud", false, "serve all projects from a cloud data directory: --cloud --addr :8080 --token <token>")
+	cloudCreateFlag := flag.Bool("cloud-create", false, "create a cloud project: --cloud-create <project-name>")
+	cloudImportFlag := flag.Bool("cloud-import", false, "import JSON into the cloud data directory: --cloud-import <project-name> <input-path.json>")
+	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for --cloud, --cloud-create, and --cloud-import")
 	serveAddrFlag := flag.String("addr", ":8080", "address for --serve")
-	serveTokenFlag := flag.String("token", "", "bearer token for --serve; can also use PROMAG_SERVER_TOKEN")
+	serveTokenFlag := flag.String("token", "", "bearer token for --serve or --cloud; can also use PROMAG_SERVER_TOKEN")
 	flag.Parse()
 
 	mouseDebugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_MOUSE"))
@@ -438,6 +443,73 @@ func main() {
 		mouseDebugLogPath = filepath.Join(os.TempDir(), "promag-mouse.log")
 	}
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
+
+	cloudActionCount := 0
+	for _, active := range []bool{*cloudFlag, *cloudCreateFlag, *cloudImportFlag} {
+		if active {
+			cloudActionCount++
+		}
+	}
+	if cloudActionCount > 1 {
+		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, and --cloud-import cannot be used together")
+		os.Exit(1)
+	}
+	if cloudActionCount > 0 {
+		if *exportFlag || *importFlag || strings.TrimSpace(*serveProjectFlag) != "" {
+			fmt.Fprintln(os.Stderr, "cloud actions cannot be combined with --export, --import, or --serve")
+			os.Exit(1)
+		}
+		cloudRegistryPath := filepath.Join(*cloudDataDirFlag, registryFile)
+		cloudProjectsBaseDir := filepath.Join(*cloudDataDirFlag, projectsDir)
+		projects, _, err := loadProjectRegistry(cloudRegistryPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load cloud project registry: %v\n", err)
+			os.Exit(1)
+		}
+		if *cloudCreateFlag {
+			args := flag.Args()
+			if len(args) != 1 {
+				fmt.Fprintln(os.Stderr, "usage: promag --cloud-create <project-name>")
+				os.Exit(1)
+			}
+			project, err := createCloudProject(cloudRegistryPath, cloudProjectsBaseDir, projects, args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "create cloud project: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Created cloud project %q (%s)\n", project.Name, project.ID)
+			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			return
+		}
+		if *cloudImportFlag {
+			args := flag.Args()
+			if len(args) != 2 {
+				fmt.Fprintln(os.Stderr, "usage: promag --cloud-import <project-name> <input-path.json>")
+				os.Exit(1)
+			}
+			project, err := importProjectBundle(cloudRegistryPath, cloudProjectsBaseDir, projects, args[1], args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "import cloud project: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Imported cloud project %q (%s)\n", project.Name, project.ID)
+			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			return
+		}
+		token := strings.TrimSpace(*serveTokenFlag)
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("PROMAG_SERVER_TOKEN"))
+		}
+		if token == "" {
+			fmt.Fprintln(os.Stderr, "cloud token is required: use --token or PROMAG_SERVER_TOKEN")
+			os.Exit(1)
+		}
+		if err := serveCloud(cloudRegistryPath, cloudProjectsBaseDir, *serveAddrFlag, token); err != nil {
+			fmt.Fprintf(os.Stderr, "serve cloud: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	registryPath := filepath.Join(".", storageDir, registryFile)
 	projectsBaseDir := filepath.Join(".", storageDir, projectsDir)
@@ -3394,11 +3466,186 @@ type projectServer struct {
 	token   string
 }
 
+type cloudServer struct {
+	registryPath    string
+	projectsBaseDir string
+	token           string
+}
+
 type remoteProjectClient struct {
 	baseURL string
 	token   string
 	actorID string
 	client  *http.Client
+}
+
+type projectCreateRequest struct {
+	Name string `json:"name"`
+}
+
+type projectImportRequest struct {
+	Name   string              `json:"name"`
+	Bundle projectExportBundle `json:"bundle"`
+}
+
+func serveCloud(registryPath, projectsBaseDir, addr, token string) error {
+	if _, _, err := loadProjectRegistry(registryPath); err != nil {
+		return err
+	}
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           newCloudServer(registryPath, projectsBaseDir, token),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	fmt.Fprintf(os.Stdout, "Serving ProMag cloud at http://%s\n", displayAddr(addr))
+	return server.ListenAndServe()
+}
+
+func newCloudServer(registryPath, projectsBaseDir, token string) http.Handler {
+	return cloudServer{registryPath: registryPath, projectsBaseDir: projectsBaseDir, token: token}
+}
+
+func (s cloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/health" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	if !authorizedToken(r, s.token) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	switch {
+	case path == "projects":
+		s.handleProjects(w, r)
+	case path == "projects/import":
+		s.handleProjectImport(w, r)
+	case len(parts) >= 2 && parts[0] == "projects":
+		s.handleProjectScoped(w, r, parts[1], parts[2:])
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s cloudServer) handleProjects(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		projects, _, err := loadProjectRegistry(s.registryPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		records := make([]exportedProjectRecord, 0, len(projects))
+		for _, project := range projects {
+			records = append(records, exportProjectRecord(project))
+		}
+		writeJSON(w, http.StatusOK, records)
+	case http.MethodPost:
+		var req projectCreateRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		projects, _, err := loadProjectRegistry(s.registryPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		project, err := createCloudProject(s.registryPath, s.projectsBaseDir, projects, req.Name)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, exportProjectRecord(project))
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s cloudServer) handleProjectImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req projectImportRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Bundle.Version != exportVersion {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported export version %d", req.Bundle.Version))
+		return
+	}
+	projects, _, err := loadProjectRegistry(s.registryPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = uniqueImportedProjectName(projects, req.Bundle.Project.Name)
+	}
+	if projectNameExists(projects, name) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("project %q already exists", name))
+		return
+	}
+	project, err := createProjectFromBundle(s.registryPath, s.projectsBaseDir, name, req.Bundle)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, exportProjectRecord(project))
+}
+
+func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request, projectID string, remainder []string) {
+	project, err := s.projectByID(projectID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if len(remainder) == 0 {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, exportProjectRecord(project))
+		return
+	}
+
+	next := r.Clone(r.Context())
+	next.URL = cloneURL(r.URL)
+	next.URL.Path = "/" + strings.Join(remainder, "/")
+	next.RequestURI = ""
+	newProjectServer(project, s.token).ServeHTTP(w, next)
+}
+
+func (s cloudServer) projectByID(projectID string) (projectRecord, error) {
+	projects, _, err := loadProjectRegistry(s.registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	for _, project := range projects {
+		if project.ID == projectID {
+			return project, nil
+		}
+	}
+	return projectRecord{}, fmt.Errorf("project %q was not found", projectID)
+}
+
+func cloneURL(value *url.URL) *url.URL {
+	copy := *value
+	return &copy
+}
+
+func displayAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "localhost:8080"
+	}
+	if strings.HasPrefix(addr, ":") {
+		return "localhost" + addr
+	}
+	return addr
 }
 
 func serveProject(project projectRecord, addr, token string) error {
@@ -3453,7 +3700,11 @@ func (s projectServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s projectServer) authorized(r *http.Request) bool {
-	if s.token == "" {
+	return authorizedToken(r, s.token)
+}
+
+func authorizedToken(r *http.Request, expected string) bool {
+	if expected == "" {
 		return false
 	}
 	token := strings.TrimSpace(r.Header.Get("X-ProMag-Token"))
@@ -3463,7 +3714,7 @@ func (s projectServer) authorized(r *http.Request) bool {
 			token = strings.TrimSpace(auth[len("bearer "):])
 		}
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) == 1
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
 }
 
 func (s projectServer) actorID(r *http.Request) string {
@@ -5495,6 +5746,10 @@ func importProjectBundle(registryPath, projectsBaseDir string, projects []projec
 		name = uniqueImportedProjectName(projects, bundle.Project.Name)
 	}
 
+	return createProjectFromBundle(registryPath, projectsBaseDir, name, bundle)
+}
+
+func createProjectFromBundle(registryPath, projectsBaseDir, name string, bundle projectExportBundle) (projectRecord, error) {
 	project, err := createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
 	if err != nil {
 		return projectRecord{}, err
@@ -5512,6 +5767,17 @@ func importProjectBundle(registryPath, projectsBaseDir string, projects []projec
 		return projectRecord{}, fmt.Errorf("save imported collaboration data: %w", err)
 	}
 	return project, nil
+}
+
+func createCloudProject(registryPath, projectsBaseDir string, projects []projectRecord, name string) (projectRecord, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return projectRecord{}, errors.New("project name is required")
+	}
+	if projectNameExists(projects, name) {
+		return projectRecord{}, fmt.Errorf("project %q already exists", name)
+	}
+	return createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
 }
 
 func selectProjectForExport(projects []projectRecord, lastProjectID, selector string) (projectRecord, error) {
@@ -5957,6 +6223,8 @@ func helpManual(width int) string {
 		"ProMag remembers the last project you opened and restores it on the next launch.",
 		"Remote projects currently store remote_url metadata and still use a local cache DB.",
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
+		"Cloud hub mode: promag --cloud --addr :8080 --token <token> --data-dir .promag-cloud serves project-scoped APIs.",
+		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
 		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
 		"",

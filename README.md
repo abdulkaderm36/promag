@@ -65,10 +65,18 @@ promag
   - Imports a project JSON file as a new local project with the given name
 - `--serve <project-id-or-name>`
   - Serves a project over a token-authenticated HTTP API for collaboration clients
+- `--cloud`
+  - Serves all projects from a cloud data directory over project-scoped collaboration APIs
+- `--cloud-create <project-name>`
+  - Creates a project in the cloud data directory
+- `--cloud-import <project-name> <path.json>`
+  - Imports a project JSON file into the cloud data directory
+- `--data-dir <path>`
+  - Data directory for `--cloud`, `--cloud-create`, and `--cloud-import`; defaults to `.promag-cloud`
 - `--addr <host:port>`
-  - Address for `--serve`; defaults to `:8080`
+  - Address for `--serve` or `--cloud`; defaults to `:8080`
 - `--token <token>`
-  - Bearer token for `--serve`; can also be set with `PROMAG_SERVER_TOKEN`
+  - Bearer token for `--serve` or `--cloud`; can also be set with `PROMAG_SERVER_TOKEN`
 
 Remote project clients use `remote_url` plus `PROMAG_REMOTE_TOKEN` for authentication. Set `PROMAG_REMOTE_ACTOR` to control the collaborator ID sent with refreshes and writes.
 
@@ -81,6 +89,9 @@ go run . --debug --debug-hitboxes
 go run . --export Ops backups/ops.json
 go run . --import "Restored Project" backups/ops.json
 go run . --serve Ops --addr :8080 --token "$PROMAG_SERVER_TOKEN"
+go run . --cloud-create --data-dir .promag-cloud Ops
+go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
+go run . --cloud --addr :8080 --token "$PROMAG_SERVER_TOKEN" --data-dir .promag-cloud
 ```
 
 ## Configuration
@@ -237,6 +248,35 @@ To connect from another ProMag TUI instance:
 3. Start the TUI with `PROMAG_REMOTE_TOKEN=<token>`
 
 Remote projects load and write through the server API. A local cache database is still kept under `.promag/projects/` so the project appears in the project switcher and can reload server state when opened. While a remote project is active, ProMag refreshes server state every few seconds, updates collaborator `last_seen_at` through authenticated requests, and shows active collaborators plus recent activity in the detail pane.
+
+## Cloud Hub
+
+Run a multi-project cloud hub when several clients need to connect to shared projects through one hosted server:
+
+```bash
+PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)" go run . --cloud --addr :8080 --data-dir .promag-cloud
+```
+
+Create or import projects into the cloud data directory:
+
+```bash
+go run . --cloud-create --data-dir .promag-cloud Ops
+go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
+```
+
+Cloud API routes are project-scoped:
+
+- `GET /projects`: list cloud projects
+- `POST /projects`: create a project with `{"name":"Ops"}`
+- `POST /projects/import`: import a JSON export bundle
+- `GET /projects/{id}`: project metadata
+- `GET /projects/{id}/state`: project state, config, collaborators, and activity
+- `GET /projects/{id}/export`: project JSON export bundle
+- `POST /projects/{id}/tasks`, `PATCH /projects/{id}/tasks/{task_id}`, `DELETE /projects/{id}/tasks/{task_id}`
+- `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{member_id}`, `DELETE /projects/{id}/members/{member_id}`
+- `PATCH /projects/{id}/config`
+
+To connect a TUI client to a cloud project, create or edit a `remote` project and set its remote URL to `http://localhost:8080/projects/{id}`. Use the deployed host name instead of `localhost` when the hub is running on a server.
 
 ## Developer Workflow
 

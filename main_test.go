@@ -546,6 +546,144 @@ func TestRemoteProjectClientLoadsAndMutatesThroughServer(t *testing.T) {
 	}
 }
 
+func TestCloudServerCreatesListsAndScopesProjectRoutes(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	handler := newCloudServer(registryPath, projectsBaseDir, "secret")
+
+	createResp := serveJSONRequest(t, handler, http.MethodPost, "/projects", mustJSON(t, projectCreateRequest{Name: "Cloud Ops"}))
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create project status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	var createdProject exportedProjectRecord
+	if err := json.Unmarshal(createResp.Body.Bytes(), &createdProject); err != nil {
+		t.Fatal(err)
+	}
+	if createdProject.Name != "Cloud Ops" || createdProject.ID == "" {
+		t.Fatalf("created project = %#v", createdProject)
+	}
+
+	listResp := serveJSONRequest(t, handler, http.MethodGet, "/projects", nil)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list projects status = %d body = %s", listResp.Code, listResp.Body.String())
+	}
+	var projects []exportedProjectRecord
+	if err := json.Unmarshal(listResp.Body.Bytes(), &projects); err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].ID != createdProject.ID {
+		t.Fatalf("projects = %#v, want created project", projects)
+	}
+
+	taskResp := serveJSONRequest(t, handler, http.MethodPost, "/projects/"+createdProject.ID+"/tasks", mustJSON(t, taskWriteRequest{
+		Task: task{Title: "Cloud task", Priority: "medium", Status: "open"},
+	}))
+	if taskResp.Code != http.StatusCreated {
+		t.Fatalf("create cloud task status = %d body = %s", taskResp.Code, taskResp.Body.String())
+	}
+
+	stateResp := serveJSONRequest(t, handler, http.MethodGet, "/projects/"+createdProject.ID+"/state", nil)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("cloud state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.State.Tasks) != 1 || state.State.Tasks[0].Title != "Cloud task" {
+		t.Fatalf("cloud tasks = %#v", state.State.Tasks)
+	}
+	if state.Project.ID != createdProject.ID {
+		t.Fatalf("state project ID = %q, want %q", state.Project.ID, createdProject.ID)
+	}
+}
+
+func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
+	defer server.Close()
+
+	t.Setenv(remoteTokenEnv, "secret")
+	t.Setenv(remoteActorEnv, "manager-cloud")
+
+	remoteProject := projectRecord{
+		ID:        "remote-cloud",
+		Name:      "Remote Cloud",
+		Type:      projectTypeRemote,
+		RemoteURL: server.URL + "/projects/" + cloudProject.ID,
+		DBPath:    filepath.Join(dir, "cloud-cache.sqlite3"),
+	}
+	m := newModel("", "", remoteProject, []projectRecord{remoteProject}, appState{}, defaultConfig())
+	created, err := m.createTaskRecord(task{Title: "Cloud remote task", Priority: "medium", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.UpdatedBy != "manager-cloud" {
+		t.Fatalf("created updated_by = %q, want manager-cloud", created.UpdatedBy)
+	}
+	if err := m.reloadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.state.Tasks) != 1 || m.state.Tasks[0].Title != "Cloud remote task" {
+		t.Fatalf("remote cloud tasks = %#v", m.state.Tasks)
+	}
+	if len(m.collaborators) == 0 || !hasCollaborator(m.collaborators, "manager-cloud") {
+		t.Fatalf("remote cloud collaborators = %#v, want manager-cloud", m.collaborators)
+	}
+}
+
+func TestCloudServerImportsProjectBundle(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	handler := newCloudServer(registryPath, projectsBaseDir, "secret")
+	bundle := projectExportBundle{
+		Version:    exportVersion,
+		ExportedAt: time.Now(),
+		Project:    exportedProjectRecord{Name: "Source Ops"},
+		Config:     appConfig{LeftWheelMode: "scroll_list", TaskSortMode: string(taskSortPriority)},
+		State: appState{Tasks: []task{{
+			ID:        "tsk-import",
+			Title:     "Imported cloud task",
+			Priority:  "high",
+			Status:    "open",
+			CreatedAt: time.Now(),
+			Version:   1,
+		}}},
+	}
+
+	importResp := serveJSONRequest(t, handler, http.MethodPost, "/projects/import", mustJSON(t, projectImportRequest{Name: "Imported Cloud", Bundle: bundle}))
+	if importResp.Code != http.StatusCreated {
+		t.Fatalf("import status = %d body = %s", importResp.Code, importResp.Body.String())
+	}
+	var imported exportedProjectRecord
+	if err := json.Unmarshal(importResp.Body.Bytes(), &imported); err != nil {
+		t.Fatal(err)
+	}
+
+	stateResp := serveJSONRequest(t, handler, http.MethodGet, "/projects/"+imported.ID+"/state", nil)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("imported state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.State.Tasks) != 1 || state.State.Tasks[0].Title != "Imported cloud task" {
+		t.Fatalf("imported cloud tasks = %#v", state.State.Tasks)
+	}
+	if state.Config.taskSortMode() != taskSortPriority {
+		t.Fatalf("imported cloud sort = %q, want priority", state.Config.taskSortMode())
+	}
+}
+
 func TestProjectServerTouchesCollaboratorOnRead(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
