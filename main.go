@@ -37,6 +37,7 @@ const (
 	remoteTokenEnv     = "PROMAG_REMOTE_TOKEN"
 	remoteActorEnv     = "PROMAG_REMOTE_ACTOR"
 	remoteRefreshEvery = 5 * time.Second
+	activeUserWindow   = 30 * time.Second
 	dateLayout         = "2006-01-02"
 	storageDir         = ".promag"
 	registryFile       = "registry.sqlite3"
@@ -263,6 +264,8 @@ type layoutState struct {
 type model struct {
 	dbPath          string
 	state           appState
+	collaborators   []collaborator
+	activityLog     []activityEvent
 	registryPath    string
 	projectsBaseDir string
 	projects        []projectRecord
@@ -511,12 +514,19 @@ func main() {
 		activeProject projectRecord
 		state         appState
 		cfg           appConfig
+		collaborators []collaborator
+		activityLog   []activityEvent
 	)
 	if project, ok := chooseActiveProject(projects, lastProjectID); ok {
 		activeProject = project
 		state, cfg, err = loadProjectData(project)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load project: %v\n", err)
+			os.Exit(1)
+		}
+		collaborators, activityLog, err = loadProjectCollaborationData(project)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load collaboration data: %v\n", err)
 			os.Exit(1)
 		}
 		if err := touchProjectLastOpened(registryPath, project.ID, time.Now()); err != nil {
@@ -534,6 +544,8 @@ func main() {
 	}
 
 	model := newModel(registryPath, projectsBaseDir, activeProject, projects, state, cfg)
+	model.collaborators = collaborators
+	model.activityLog = activityLog
 	if width, height, ok := detectTerminalSize(); ok {
 		model.width = width
 		model.height = height
@@ -719,6 +731,8 @@ func (m model) handleRemoteRefresh(msg remoteRefreshMsg) (tea.Model, tea.Cmd) {
 func (m *model) applyRemoteState(response stateResponse) {
 	m.state = response.State
 	m.config = response.Config
+	m.collaborators = response.Collaborators
+	m.activityLog = response.ActivityLog
 	m.refreshMemberSuggestions()
 	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive} {
 		m.clampViewCursor(view)
@@ -1339,6 +1353,7 @@ func (m model) renderHeader() string {
 		m.renderMetric("Done", fmt.Sprintf("%d", m.doneTaskCount()), ui.success),
 		m.renderMetric("Overdue", fmt.Sprintf("%d", m.overdueTaskCount()), ui.danger),
 		m.renderMetric("People", fmt.Sprintf("%d", len(m.state.Members)), ui.borderStrong),
+		m.renderMetric("Active", fmt.Sprintf("%d", m.activeCollaboratorCount(time.Now())), ui.success),
 	)
 	if lipgloss.Width(tabsLine) > contentWidth {
 		tabsLine = ui.subtitle.Render("1-4 switch views")
@@ -1495,6 +1510,11 @@ func (m model) renderDetail(width, height int) string {
 	content := m.detailContent()
 	if m.activeView == viewHelp {
 		content = helpManual(innerWidth)
+	} else if collaboration := m.collaborationDetail(); collaboration != "" {
+		if strings.TrimSpace(content) != "" {
+			content += "\n\n"
+		}
+		content += collaboration
 	}
 	content = lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
 	content = renderViewport(content, innerWidth, max(1, height-4), m.detailScroll[m.activeView])
@@ -1888,6 +1908,11 @@ func (m model) detailViewportContent() string {
 	content := m.detailContent()
 	if m.activeView == viewHelp {
 		content = helpManual(innerWidth)
+	} else if collaboration := m.collaborationDetail(); collaboration != "" {
+		if strings.TrimSpace(content) != "" {
+			content += "\n\n"
+		}
+		content += collaboration
 	}
 	return lipgloss.NewStyle().Width(innerWidth).Align(lipgloss.Left).Render(content)
 }
@@ -2385,6 +2410,10 @@ func (m *model) activateProject(project projectRecord) error {
 	if err != nil {
 		return fmt.Errorf("load project %q: %w", project.Name, err)
 	}
+	collaborators, activityLog, err := loadProjectCollaborationData(project)
+	if err != nil {
+		return fmt.Errorf("load collaboration data for %q: %w", project.Name, err)
+	}
 	if err := touchProjectLastOpened(m.registryPath, project.ID, time.Now()); err != nil {
 		return fmt.Errorf("update last project: %w", err)
 	}
@@ -2400,6 +2429,8 @@ func (m *model) activateProject(project projectRecord) error {
 	m.dbPath = selected.DBPath
 	m.state = state
 	m.config = cfg
+	m.collaborators = collaborators
+	m.activityLog = activityLog
 	m.projects = projects
 	m.currentProject = selected
 	m.filter = filterState{}
@@ -2747,6 +2778,9 @@ func (m model) taskDetail() string {
 		"",
 		ui.subtitle.Render(fmt.Sprintf("Created %s", selected.CreatedAt.Format("2006-01-02 15:04"))),
 	}
+	if !selected.UpdatedAt.IsZero() {
+		lines = append(lines, ui.subtitle.Render(fmt.Sprintf("Updated %s by %s", selected.UpdatedAt.Format("2006-01-02 15:04"), m.collaboratorDisplayName(selected.UpdatedBy))))
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -2764,9 +2798,11 @@ func (m model) memberDetail() string {
 		m.detailPair("Role", fallback(selected.Role, "none")),
 		m.detailPair("Contact", fallback(selected.Email, "none")),
 		m.detailPair("Badge", memberBadge(selected.Name)),
-		"",
-		ui.inputLabel.Render("Tasks"),
 	}
+	if !selected.UpdatedAt.IsZero() {
+		lines = append(lines, ui.subtitle.Render(fmt.Sprintf("Updated %s by %s", selected.UpdatedAt.Format("2006-01-02 15:04"), m.collaboratorDisplayName(selected.UpdatedBy))))
+	}
+	lines = append(lines, "", ui.inputLabel.Render("Tasks"))
 	if len(tasks) == 0 {
 		lines = append(lines, ui.subtitle.Render("No tasks assigned yet."))
 		return strings.Join(lines, "\n")
@@ -2783,6 +2819,117 @@ func (m model) memberDetail() string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m model) collaborationDetail() string {
+	if len(m.collaborators) == 0 && len(m.activityLog) == 0 {
+		return ""
+	}
+
+	now := time.Now()
+	lines := []string{ui.sectionTitle.Render("Collaboration")}
+	active := m.activeCollaborators(now)
+	if len(active) > 0 {
+		names := make([]string, 0, len(active))
+		for _, collab := range active {
+			label := m.collaboratorDisplayName(collab.ID)
+			if role := strings.TrimSpace(collab.Role); role != "" {
+				label += " (" + role + ")"
+			}
+			names = append(names, label)
+		}
+		lines = append(lines, ui.inputLabel.Render("Active"), strings.Join(names, ", "))
+	}
+
+	activity := m.recentActivityLines(now, 5)
+	if len(activity) > 0 {
+		if len(lines) > 1 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, ui.inputLabel.Render("Recent Activity"))
+		lines = append(lines, activity...)
+	}
+
+	if len(lines) == 1 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) activeCollaboratorCount(now time.Time) int {
+	return len(m.activeCollaborators(now))
+}
+
+func (m model) activeCollaborators(now time.Time) []collaborator {
+	active := make([]collaborator, 0, len(m.collaborators))
+	for _, collab := range m.collaborators {
+		if collab.LastSeenAt.IsZero() {
+			continue
+		}
+		age := now.Sub(collab.LastSeenAt)
+		if age >= -time.Minute && age <= activeUserWindow {
+			active = append(active, collab)
+		}
+	}
+	return active
+}
+
+func (m model) recentActivityLines(now time.Time, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	lines := make([]string, 0, min(limit, len(m.activityLog)))
+	for i := len(m.activityLog) - 1; i >= 0 && len(lines) < limit; i-- {
+		event := m.activityLog[i]
+		summary := strings.TrimSpace(event.Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(strings.Join([]string{event.Action, event.EntityType}, " "))
+		}
+		if summary == "" {
+			summary = "Updated project"
+		}
+		line := fmt.Sprintf("- %s · %s · %s", summary, m.collaboratorDisplayName(event.ActorID), relativeTime(now, event.CreatedAt))
+		lines = append(lines, ui.subtitle.Render(line))
+	}
+	return lines
+}
+
+func (m model) collaboratorDisplayName(actorID string) string {
+	actorID = normalizeActorID(actorID)
+	for _, collab := range m.collaborators {
+		if collab.ID == actorID {
+			if name := strings.TrimSpace(collab.Name); name != "" {
+				return name
+			}
+			break
+		}
+	}
+	if actorID == localActorID {
+		return "Local User"
+	}
+	return actorID
+}
+
+func relativeTime(now, then time.Time) string {
+	if then.IsZero() {
+		return "unknown time"
+	}
+	elapsed := now.Sub(then)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	switch {
+	case elapsed < time.Minute:
+		return "just now"
+	case elapsed < time.Hour:
+		return fmt.Sprintf("%dm ago", int(elapsed.Minutes()))
+	case elapsed < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(elapsed.Hours()))
+	case elapsed < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(elapsed.Hours()/24))
+	default:
+		return then.Format(dateLayout)
+	}
 }
 
 func (m model) dateDetail() string {
@@ -3772,6 +3919,21 @@ func loadProjectData(project projectRecord) (appState, appConfig, error) {
 	return state, cfg, nil
 }
 
+func loadProjectCollaborationData(project projectRecord) ([]collaborator, []activityEvent, error) {
+	if strings.TrimSpace(project.DBPath) == "" {
+		return nil, nil, nil
+	}
+	collaborators, err := loadCollaborators(project.DBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	activityLog, err := loadActivityLog(project.DBPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return collaborators, activityLog, nil
+}
+
 func fetchAndCacheRemoteProject(project projectRecord) (stateResponse, error) {
 	client, err := newRemoteProjectClient(project)
 	if err != nil {
@@ -3919,12 +4081,20 @@ func (m *model) reloadState() error {
 		}
 		state = response.State
 		m.config = response.Config
+		m.collaborators = response.Collaborators
+		m.activityLog = response.ActivityLog
 	} else {
 		loaded, err := loadState(m.dbPath)
 		if err != nil {
 			return err
 		}
 		state = loaded
+		collaborators, activityLog, err := loadProjectCollaborationData(m.currentProject)
+		if err != nil {
+			return err
+		}
+		m.collaborators = collaborators
+		m.activityLog = activityLog
 	}
 	m.state = state
 	m.refreshMemberSuggestions()
@@ -5788,7 +5958,7 @@ func helpManual(width int) string {
 		"Remote projects currently store remote_url metadata and still use a local cache DB.",
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
-		"Active remote projects refresh server state every few seconds.",
+		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",

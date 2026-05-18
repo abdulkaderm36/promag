@@ -236,7 +236,7 @@ To connect from another ProMag TUI instance:
 2. Set the remote URL to the server, for example `http://localhost:8080`
 3. Start the TUI with `PROMAG_REMOTE_TOKEN=<token>`
 
-Remote projects load and write through the server API. A local cache database is still kept under `.promag/projects/` so the project appears in the project switcher and can reload server state when opened. While a remote project is active, ProMag refreshes server state every few seconds and updates collaborator `last_seen_at` through authenticated requests.
+Remote projects load and write through the server API. A local cache database is still kept under `.promag/projects/` so the project appears in the project switcher and can reload server state when opened. While a remote project is active, ProMag refreshes server state every few seconds, updates collaborator `last_seen_at` through authenticated requests, and shows active collaborators plus recent activity in the detail pane.
 
 ## Developer Workflow
 

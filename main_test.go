@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -578,6 +579,8 @@ func TestHandleRemoteRefreshAppliesLatestState(t *testing.T) {
 			State: appState{
 				Tasks: []task{{ID: "tsk-1", Title: "Refreshed", Status: "open", Priority: "medium", Version: 1}},
 			},
+			Collaborators: []collaborator{{ID: "manager-1", Name: "Manager One", LastSeenAt: time.Now()}},
+			ActivityLog:   []activityEvent{{ID: "act-1", ActorID: "manager-1", Summary: "updated task", CreatedAt: time.Now()}},
 		},
 	}
 
@@ -588,6 +591,58 @@ func TestHandleRemoteRefreshAppliesLatestState(t *testing.T) {
 	}
 	if got.config.taskSortMode() != taskSortTitle {
 		t.Fatalf("sort mode = %q, want title", got.config.taskSortMode())
+	}
+	if len(got.collaborators) != 1 || got.collaborators[0].ID != "manager-1" {
+		t.Fatalf("collaborators = %#v", got.collaborators)
+	}
+	if len(got.activityLog) != 1 || got.activityLog[0].ID != "act-1" {
+		t.Fatalf("activity log = %#v", got.activityLog)
+	}
+}
+
+func TestActiveCollaboratorCountUsesLastSeenWindow(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	m := model{collaborators: []collaborator{
+		{ID: "active", LastSeenAt: now.Add(-activeUserWindow + time.Second)},
+		{ID: "stale", LastSeenAt: now.Add(-activeUserWindow - time.Second)},
+		{ID: "unknown"},
+	}}
+
+	if got := m.activeCollaboratorCount(now); got != 1 {
+		t.Fatalf("active collaborator count = %d, want 1", got)
+	}
+}
+
+func TestCollaborationDetailShowsActiveUsersAndRecentActivity(t *testing.T) {
+	now := time.Now()
+	m := model{
+		collaborators: []collaborator{{ID: "manager-1", Name: "Manager One", Role: "manager", LastSeenAt: now}},
+		activityLog:   []activityEvent{{ID: "act-1", ActorID: "manager-1", Summary: "updated task Roadmap", CreatedAt: now.Add(-2 * time.Minute)}},
+	}
+
+	got := m.collaborationDetail()
+	for _, want := range []string{"Manager One (manager)", "updated task Roadmap"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("collaboration detail = %q, want to contain %q", got, want)
+		}
+	}
+}
+
+func TestRecentActivityLinesUsesRelativeTime(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	m := model{
+		collaborators: []collaborator{{ID: "manager-1", Name: "Manager One"}},
+		activityLog:   []activityEvent{{ID: "act-1", ActorID: "manager-1", Summary: "updated task Roadmap", CreatedAt: now.Add(-2 * time.Minute)}},
+	}
+
+	lines := m.recentActivityLines(now, 5)
+	if len(lines) != 1 {
+		t.Fatalf("activity lines = %#v, want one line", lines)
+	}
+	for _, want := range []string{"updated task Roadmap", "Manager One", "2m ago"} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("activity line = %q, want to contain %q", lines[0], want)
+		}
 	}
 }
 
