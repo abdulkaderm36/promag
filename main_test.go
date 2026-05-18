@@ -1,7 +1,9 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -116,7 +118,7 @@ func TestExportImportProjectBundleRoundTrip(t *testing.T) {
 	createdAt := time.Date(2026, 5, 14, 9, 30, 0, 0, time.UTC)
 	state := appState{
 		Members: []member{
-			{ID: "mem-1", Name: "Ali", Role: "Manager", Email: "ali@example.com"},
+			{ID: "mem-1", Name: "Ali", Role: "Manager", Email: "ali@example.com", Version: 1},
 		},
 		Tasks: []task{
 			{
@@ -130,6 +132,7 @@ func TestExportImportProjectBundleRoundTrip(t *testing.T) {
 				DueDate:   "2026-05-20",
 				Status:    "open",
 				CreatedAt: createdAt,
+				Version:   1,
 			},
 		},
 	}
@@ -215,6 +218,198 @@ func TestSelectProjectForExportRequiresIDForAmbiguousName(t *testing.T) {
 	if project.ID != "prj-2" {
 		t.Fatalf("selected project ID = %q, want prj-2", project.ID)
 	}
+}
+
+func TestExportImportPreservesCollaborationMetadata(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Collab", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createTask(project.DBPath, task{Title: "Coordinate release", Priority: "medium", Status: "open"}, "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	projects, lastProjectID, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportPath := filepath.Join(dir, "collab.json")
+	if _, err := exportProjectBundle(projects, lastProjectID, "Collab", exportPath); err != nil {
+		t.Fatal(err)
+	}
+
+	projects, _, err = loadProjectRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := importProjectBundle(registryPath, projectsBaseDir, projects, exportPath, "Collab Restored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	collaborators, err := loadCollaborators(imported.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCollaborator(collaborators, "actor-1") {
+		t.Fatalf("imported collaborators = %#v, want actor-1", collaborators)
+	}
+	events, err := loadActivityLog(imported.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != "task.created" {
+		t.Fatalf("imported activity = %#v, want one task.created event", events)
+	}
+}
+
+func TestOpenStorageMigratesOldSchemaAndCreatesBackup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE members (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			email TEXT NOT NULL
+		);
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			member_id TEXT NOT NULL,
+			category TEXT NOT NULL,
+			priority TEXT NOT NULL,
+			tags_json TEXT NOT NULL,
+			comments_json TEXT NOT NULL,
+			due_date TEXT NOT NULL,
+			status TEXT NOT NULL,
+			archived INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE config (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		INSERT INTO members (id, name, role, email) VALUES ('mem-old', 'Sara', 'Lead', 'sara@example.com');
+		INSERT INTO tasks (
+			id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at
+		) VALUES (
+			'tsk-old', 'Review migration', 'mem-old', 'backend', 'medium', '[]', '[]', '2026-05-21', 'open', 0, '2026-05-17T08:00:00Z'
+		);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := openStorage(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+
+	backups, err := filepath.Glob(path + ".bak-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("backup count = %d, want 1", len(backups))
+	}
+	for _, table := range []string{"members", "tasks"} {
+		for _, column := range []string{"version", "updated_at", "updated_by"} {
+			ok, err := columnExists(migrated, table, column)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatalf("%s.%s was not migrated", table, column)
+			}
+		}
+	}
+
+	state, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Members) != 1 || state.Members[0].Version != 1 {
+		t.Fatalf("migrated members = %#v, want one versioned member", state.Members)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Version != 1 {
+		t.Fatalf("migrated tasks = %#v, want one versioned task", state.Tasks)
+	}
+	backups, err = filepath.Glob(path + ".bak-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("backup count after second open = %d, want 1", len(backups))
+	}
+}
+
+func TestUpdateTaskDetectsStaleVersionAndLogsActivity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.sqlite3")
+	task, err := createTask(path, task{
+		Title:     "Write API plan",
+		Priority:  "medium",
+		Status:    "open",
+		CreatedAt: time.Date(2026, 5, 17, 10, 0, 0, 0, time.UTC),
+	}, "actor-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated := task
+	updated.Title = "Write collaboration API plan"
+	updated, err = updateTask(path, updated, task.Version, "actor-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 {
+		t.Fatalf("updated version = %d, want 2", updated.Version)
+	}
+
+	task.Title = "Stale title"
+	if _, err := updateTask(path, task, task.Version, "actor-2"); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale update error = %v, want errVersionConflict", err)
+	}
+
+	state, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Tasks[0].Title; got != "Write collaboration API plan" {
+		t.Fatalf("task title = %q, want latest title", got)
+	}
+	if got := state.Tasks[0].Version; got != 2 {
+		t.Fatalf("task version = %d, want 2", got)
+	}
+
+	events, err := loadActivityLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("activity event count = %d, want 2", len(events))
+	}
+	if events[0].Action != "task.created" || events[1].Action != "task.updated" {
+		t.Fatalf("activity actions = %q, %q", events[0].Action, events[1].Action)
+	}
+}
+
+func hasCollaborator(collaborators []collaborator, id string) bool {
+	for _, collab := range collaborators {
+		if collab.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func taskIDs(tasks []task) []string {

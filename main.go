@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,6 +28,9 @@ import (
 const (
 	appTitle          = "ProMag"
 	exportVersion     = 1
+	storageSchemaKey  = "schema_version"
+	storageSchemaVer  = 2
+	localActorID      = "local"
 	dateLayout        = "2006-01-02"
 	storageDir        = ".promag"
 	registryFile      = "registry.sqlite3"
@@ -43,6 +47,7 @@ var ui = newTheme()
 var mouseDebugLogPath string
 var mouseDebugOverlay bool
 var currentLayout layoutState
+var errVersionConflict = errors.New("record changed since it was loaded")
 
 type viewMode string
 
@@ -83,10 +88,13 @@ type zone struct {
 }
 
 type member struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
-	Email string `json:"email"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Role      string    `json:"role"`
+	Email     string    `json:"email"`
+	Version   int       `json:"version,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	UpdatedBy string    `json:"updated_by,omitempty"`
 }
 
 type task struct {
@@ -101,11 +109,32 @@ type task struct {
 	Status    string    `json:"status"`
 	Archived  bool      `json:"archived"`
 	CreatedAt time.Time `json:"created_at"`
+	Version   int       `json:"version,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	UpdatedBy string    `json:"updated_by,omitempty"`
 }
 
 type appState struct {
 	Members []member `json:"members"`
 	Tasks   []task   `json:"tasks"`
+}
+
+type collaborator struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Role       string    `json:"role"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
+}
+
+type activityEvent struct {
+	ID         string    `json:"id"`
+	ActorID    string    `json:"actor_id"`
+	Action     string    `json:"action"`
+	EntityType string    `json:"entity_type"`
+	EntityID   string    `json:"entity_id"`
+	Summary    string    `json:"summary"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type appConfig struct {
@@ -140,11 +169,13 @@ type projectRecord struct {
 }
 
 type projectExportBundle struct {
-	Version    int                   `json:"version"`
-	ExportedAt time.Time             `json:"exported_at"`
-	Project    exportedProjectRecord `json:"project"`
-	Config     appConfig             `json:"config"`
-	State      appState              `json:"state"`
+	Version       int                   `json:"version"`
+	ExportedAt    time.Time             `json:"exported_at"`
+	Project       exportedProjectRecord `json:"project"`
+	Config        appConfig             `json:"config"`
+	State         appState              `json:"state"`
+	Collaborators []collaborator        `json:"collaborators,omitempty"`
+	ActivityLog   []activityEvent       `json:"activity_log,omitempty"`
 }
 
 type exportedProjectRecord struct {
@@ -249,11 +280,13 @@ type model struct {
 
 	overlay overlayMode
 
-	editingTaskID    string
-	editingMemberID  string
-	editingProjectID string
-	mouseEnabled     bool
-	config           appConfig
+	editingTaskID      string
+	editingTaskVersion int
+	editingMemberID    string
+	editingMemberVer   int
+	editingProjectID   string
+	mouseEnabled       bool
+	config             appConfig
 
 	memberInputs  []textinput.Model
 	taskInputs    []textinput.Model
@@ -1819,7 +1852,9 @@ func (m *model) closeOverlay(status string) {
 	m.overlay = overlayNone
 	m.formCursor = 0
 	m.editingTaskID = ""
+	m.editingTaskVersion = 0
 	m.editingMemberID = ""
+	m.editingMemberVer = 0
 	m.editingProjectID = ""
 	m.projectCreate = false
 	m.projectLocked = false
@@ -1848,6 +1883,7 @@ func (m *model) openMemberForm() {
 	m.overlay = overlayMember
 	m.formCursor = 0
 	m.editingMemberID = ""
+	m.editingMemberVer = 0
 	for i := range m.memberInputs {
 		m.memberInputs[i].SetValue("")
 		m.memberInputs[i].Blur()
@@ -1859,6 +1895,7 @@ func (m *model) openTaskForm(defaultMembers, defaultDueDate string) {
 	m.overlay = overlayTask
 	m.formCursor = 0
 	m.editingTaskID = ""
+	m.editingTaskVersion = 0
 	for i := range m.taskInputs {
 		m.taskInputs[i].SetValue("")
 		m.taskInputs[i].Blur()
@@ -1912,6 +1949,7 @@ func (m *model) openMemberEditForm(selected *member) {
 	m.overlay = overlayMember
 	m.formCursor = 0
 	m.editingMemberID = selected.ID
+	m.editingMemberVer = selected.Version
 	for i := range m.memberInputs {
 		m.memberInputs[i].SetValue("")
 		m.memberInputs[i].Blur()
@@ -1929,6 +1967,7 @@ func (m *model) openTaskEditForm(selected *task) {
 	m.overlay = overlayTask
 	m.formCursor = 0
 	m.editingTaskID = selected.ID
+	m.editingTaskVersion = selected.Version
 	for i := range m.taskInputs {
 		m.taskInputs[i].SetValue("")
 		m.taskInputs[i].Blur()
@@ -2069,26 +2108,25 @@ func (m *model) submitMemberForm() error {
 		return fmt.Errorf("member %q already exists", name)
 	}
 	if m.editingMemberID != "" {
-		for i := range m.state.Members {
-			if m.state.Members[i].ID != m.editingMemberID {
-				continue
-			}
-			m.state.Members[i].Name = name
-			m.state.Members[i].Role = role
-			m.state.Members[i].Email = email
-			m.refreshMemberSuggestions()
-			return saveState(m.dbPath, m.state)
+		mem := member{
+			ID:    m.editingMemberID,
+			Name:  name,
+			Role:  role,
+			Email: email,
 		}
-		return errors.New("member to edit was not found")
+		if _, err := updateMember(m.dbPath, mem, m.editingMemberVer, localActorID); err != nil {
+			return m.handleStorageError(err, "Member changed elsewhere. Reloaded latest version.")
+		}
+		return m.reloadState()
 	}
-	m.state.Members = append(m.state.Members, member{
-		ID:    nextID("mem", time.Now()),
+	if _, err := createMember(m.dbPath, member{
 		Name:  name,
 		Role:  role,
 		Email: email,
-	})
-	m.refreshMemberSuggestions()
-	return saveState(m.dbPath, m.state)
+	}, localActorID); err != nil {
+		return err
+	}
+	return m.reloadState()
 }
 
 func (m *model) submitTaskForm() error {
@@ -2121,33 +2159,31 @@ func (m *model) submitTaskForm() error {
 		if len(memberIDs) > 1 {
 			return errors.New("editing a task supports at most one member")
 		}
-		for i := range m.state.Tasks {
-			if m.state.Tasks[i].ID != m.editingTaskID {
-				continue
-			}
-			memberID := ""
-			if len(memberIDs) == 1 {
-				memberID = memberIDs[0]
-			}
-			m.state.Tasks[i].Title = title
-			m.state.Tasks[i].MemberID = memberID
-			m.state.Tasks[i].Category = category
-			m.state.Tasks[i].Priority = priority
-			m.state.Tasks[i].Tags = tags
-			m.state.Tasks[i].Comments = comments
-			m.state.Tasks[i].DueDate = dueDate
-			if err := saveState(m.dbPath, m.state); err != nil {
-				return err
-			}
-			m.activeView = viewTasks
-			return nil
+		selected := m.taskByID(m.editingTaskID)
+		if selected == nil {
+			return errors.New("task to edit was not found")
 		}
-		return errors.New("task to edit was not found")
+		memberID := ""
+		if len(memberIDs) == 1 {
+			memberID = memberIDs[0]
+		}
+		updated := *selected
+		updated.Title = title
+		updated.MemberID = memberID
+		updated.Category = category
+		updated.Priority = priority
+		updated.Tags = tags
+		updated.Comments = comments
+		updated.DueDate = dueDate
+		if _, err := updateTask(m.dbPath, updated, m.editingTaskVersion, localActorID); err != nil {
+			return m.handleStorageError(err, "Task changed elsewhere. Reloaded latest version.")
+		}
+		m.activeView = viewTasks
+		return m.reloadState()
 	}
 
 	for _, memberID := range memberIDs {
-		m.state.Tasks = append(m.state.Tasks, task{
-			ID:        nextID("tsk", time.Now()),
+		if _, err := createTask(m.dbPath, task{
 			Title:     title,
 			MemberID:  memberID,
 			Category:  category,
@@ -2157,10 +2193,12 @@ func (m *model) submitTaskForm() error {
 			DueDate:   dueDate,
 			Status:    "open",
 			CreatedAt: time.Now(),
-		})
+		}, localActorID); err != nil {
+			return err
+		}
 	}
 
-	if err := saveState(m.dbPath, m.state); err != nil {
+	if err := m.reloadState(); err != nil {
 		return err
 	}
 	m.activeView = viewTasks
@@ -2180,8 +2218,12 @@ func (m *model) submitNoteForm() (int, error) {
 	if len(tasks) == 0 {
 		return 0, errors.New("quick note did not produce any tasks")
 	}
-	m.state.Tasks = append(m.state.Tasks, tasks...)
-	if err := saveState(m.dbPath, m.state); err != nil {
+	for _, task := range tasks {
+		if _, err := createTask(m.dbPath, task, localActorID); err != nil {
+			return 0, err
+		}
+	}
+	if err := m.reloadState(); err != nil {
 		return 0, err
 	}
 	m.activeView = viewTasks
@@ -2374,22 +2416,29 @@ func (m model) toggleSelectedTask() model {
 		m.setStatus("No task selected.")
 		return m
 	}
-	for i := range m.state.Tasks {
-		if m.state.Tasks[i].ID != selected.ID {
-			continue
-		}
-		if m.state.Tasks[i].Status == "done" {
-			m.state.Tasks[i].Status = "open"
-			m.setStatus("Task reopened.")
-		} else {
-			m.state.Tasks[i].Status = "done"
-			m.setStatus("Task completed.")
-		}
-		break
+	nextStatus := "done"
+	statusMessage := "Task completed."
+	if selected.Status == "done" {
+		nextStatus = "open"
+		statusMessage = "Task reopened."
 	}
-	if err := saveState(m.dbPath, m.state); err != nil {
+	if err := setTaskStatus(m.dbPath, selected.ID, nextStatus, selected.Version, localActorID); err != nil {
+		if errors.Is(err, errVersionConflict) {
+			if reloadErr := m.reloadState(); reloadErr != nil {
+				m.setStatus("reload failed: " + reloadErr.Error())
+				return m
+			}
+			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			return m
+		}
 		m.setStatus("save failed: " + err.Error())
+		return m
 	}
+	if err := m.reloadState(); err != nil {
+		m.setStatus("reload failed: " + err.Error())
+		return m
+	}
+	m.setStatus(statusMessage)
 	return m
 }
 
@@ -2407,15 +2456,20 @@ func (m model) archiveSelectedTask() model {
 		m.setStatus("Only completed tasks can be archived.")
 		return m
 	}
-	for i := range m.state.Tasks {
-		if m.state.Tasks[i].ID != selected.ID {
-			continue
+	if err := setTaskArchived(m.dbPath, selected.ID, true, selected.Version, localActorID); err != nil {
+		if errors.Is(err, errVersionConflict) {
+			if reloadErr := m.reloadState(); reloadErr != nil {
+				m.setStatus("reload failed: " + reloadErr.Error())
+				return m
+			}
+			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			return m
 		}
-		m.state.Tasks[i].Archived = true
-		break
-	}
-	if err := saveState(m.dbPath, m.state); err != nil {
 		m.setStatus("save failed: " + err.Error())
+		return m
+	}
+	if err := m.reloadState(); err != nil {
+		m.setStatus("reload failed: " + err.Error())
 		return m
 	}
 	m.setStatus("Task archived.")
@@ -2433,15 +2487,20 @@ func (m model) restoreSelectedTask() model {
 		m.setStatus("No archived task selected.")
 		return m
 	}
-	for i := range m.state.Tasks {
-		if m.state.Tasks[i].ID != selected.ID {
-			continue
+	if err := setTaskArchived(m.dbPath, selected.ID, false, selected.Version, localActorID); err != nil {
+		if errors.Is(err, errVersionConflict) {
+			if reloadErr := m.reloadState(); reloadErr != nil {
+				m.setStatus("reload failed: " + reloadErr.Error())
+				return m
+			}
+			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			return m
 		}
-		m.state.Tasks[i].Archived = false
-		break
-	}
-	if err := saveState(m.dbPath, m.state); err != nil {
 		m.setStatus("save failed: " + err.Error())
+		return m
+	}
+	if err := m.reloadState(); err != nil {
+		m.setStatus("reload failed: " + err.Error())
 		return m
 	}
 	m.setStatus("Task restored.")
@@ -2457,9 +2516,20 @@ func (m model) deleteSelected() model {
 			m.setStatus("No task selected.")
 			return m
 		}
-		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
-		if err := saveState(m.dbPath, m.state); err != nil {
+		if err := deleteTask(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+			if errors.Is(err, errVersionConflict) {
+				if reloadErr := m.reloadState(); reloadErr != nil {
+					m.setStatus("reload failed: " + reloadErr.Error())
+					return m
+				}
+				m.setStatus("Task changed elsewhere. Reloaded latest version.")
+				return m
+			}
 			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		if err := m.reloadState(); err != nil {
+			m.setStatus("reload failed: " + err.Error())
 			return m
 		}
 		m.setStatus("Task deleted.")
@@ -2469,9 +2539,20 @@ func (m model) deleteSelected() model {
 			m.setStatus("No archived task selected.")
 			return m
 		}
-		m.state.Tasks = slices.DeleteFunc(m.state.Tasks, func(t task) bool { return t.ID == selected.ID })
-		if err := saveState(m.dbPath, m.state); err != nil {
+		if err := deleteTask(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+			if errors.Is(err, errVersionConflict) {
+				if reloadErr := m.reloadState(); reloadErr != nil {
+					m.setStatus("reload failed: " + reloadErr.Error())
+					return m
+				}
+				m.setStatus("Task changed elsewhere. Reloaded latest version.")
+				return m
+			}
 			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		if err := m.reloadState(); err != nil {
+			m.setStatus("reload failed: " + err.Error())
 			return m
 		}
 		m.setStatus("Archived task deleted.")
@@ -2486,10 +2567,20 @@ func (m model) deleteSelected() model {
 			m.setStatus("Delete member blocked: remove or reassign their tasks first.")
 			return m
 		}
-		m.state.Members = slices.DeleteFunc(m.state.Members, func(mem member) bool { return mem.ID == selected.ID })
-		m.refreshMemberSuggestions()
-		if err := saveState(m.dbPath, m.state); err != nil {
+		if err := deleteMember(m.dbPath, selected.ID, selected.Version, localActorID); err != nil {
+			if errors.Is(err, errVersionConflict) {
+				if reloadErr := m.reloadState(); reloadErr != nil {
+					m.setStatus("reload failed: " + reloadErr.Error())
+					return m
+				}
+				m.setStatus("Member changed elsewhere. Reloaded latest version.")
+				return m
+			}
 			m.setStatus("save failed: " + err.Error())
+			return m
+		}
+		if err := m.reloadState(); err != nil {
+			m.setStatus("reload failed: " + err.Error())
 			return m
 		}
 		m.setStatus("Member deleted.")
@@ -3052,6 +3143,46 @@ func (m model) findMemberByName(name string) *member {
 	return nil
 }
 
+func (m model) taskByID(id string) *task {
+	for _, t := range m.state.Tasks {
+		if t.ID == id {
+			copy := t
+			return &copy
+		}
+	}
+	return nil
+}
+
+func (m *model) reloadState() error {
+	state, err := loadState(m.dbPath)
+	if err != nil {
+		return err
+	}
+	m.state = state
+	m.refreshMemberSuggestions()
+	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive} {
+		m.clampViewCursor(view)
+	}
+	return nil
+}
+
+func (m *model) clampViewCursor(view viewMode) {
+	current := m.activeView
+	m.activeView = view
+	m.clampCursor(len(m.rowsForView()))
+	m.activeView = current
+}
+
+func (m *model) handleStorageError(err error, conflictMessage string) error {
+	if !errors.Is(err, errVersionConflict) {
+		return err
+	}
+	if reloadErr := m.reloadState(); reloadErr != nil {
+		return fmt.Errorf("%s Reload failed: %w", conflictMessage, reloadErr)
+	}
+	return errors.New(conflictMessage)
+}
+
 func loadState(path string) (appState, error) {
 	db, err := openStorage(path)
 	if err != nil {
@@ -3065,24 +3196,32 @@ func loadState(path string) (appState, error) {
 
 	state := appState{}
 
-	memberRows, err := db.Query(`SELECT id, name, role, email FROM members ORDER BY rowid`)
+	memberRows, err := db.Query(`SELECT id, name, role, email, version, updated_at, updated_by FROM members ORDER BY rowid`)
 	if err != nil {
 		return state, err
 	}
 	defer memberRows.Close()
 
 	for memberRows.Next() {
-		var mem member
-		if err := memberRows.Scan(&mem.ID, &mem.Name, &mem.Role, &mem.Email); err != nil {
+		var (
+			mem       member
+			updatedAt string
+		)
+		if err := memberRows.Scan(&mem.ID, &mem.Name, &mem.Role, &mem.Email, &mem.Version, &updatedAt, &mem.UpdatedBy); err != nil {
 			return state, err
 		}
+		mem.UpdatedAt, err = parseStoredTime(updatedAt)
+		if err != nil {
+			return state, err
+		}
+		mem.Version = normalizedVersion(mem.Version)
 		state.Members = append(state.Members, mem)
 	}
 	if err := memberRows.Err(); err != nil {
 		return state, err
 	}
 
-	taskRows, err := db.Query(`SELECT id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at FROM tasks ORDER BY rowid`)
+	taskRows, err := db.Query(`SELECT id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at, version, updated_at, updated_by FROM tasks ORDER BY rowid`)
 	if err != nil {
 		return state, err
 	}
@@ -3094,6 +3233,7 @@ func loadState(path string) (appState, error) {
 			tagsJSON     string
 			commentsJSON string
 			createdAt    string
+			updatedAt    string
 			archived     bool
 		)
 		if err := taskRows.Scan(
@@ -3108,6 +3248,9 @@ func loadState(path string) (appState, error) {
 			&t.Status,
 			&archived,
 			&createdAt,
+			&t.Version,
+			&updatedAt,
+			&t.UpdatedBy,
 		); err != nil {
 			return state, err
 		}
@@ -3123,15 +3266,87 @@ func loadState(path string) (appState, error) {
 			}
 		}
 		if createdAt != "" {
-			parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+			parsed, err := parseStoredTime(createdAt)
 			if err != nil {
 				return state, err
 			}
 			t.CreatedAt = parsed
 		}
+		t.UpdatedAt, err = parseStoredTime(updatedAt)
+		if err != nil {
+			return state, err
+		}
+		t.Version = normalizedVersion(t.Version)
 		state.Tasks = append(state.Tasks, t)
 	}
 	return state, taskRows.Err()
+}
+
+func loadCollaborators(path string) ([]collaborator, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, name, role, created_at, last_seen_at FROM collaborators ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var collaborators []collaborator
+	for rows.Next() {
+		var (
+			collab     collaborator
+			createdAt  string
+			lastSeenAt string
+		)
+		if err := rows.Scan(&collab.ID, &collab.Name, &collab.Role, &createdAt, &lastSeenAt); err != nil {
+			return nil, err
+		}
+		collab.CreatedAt, err = parseStoredTime(createdAt)
+		if err != nil {
+			return nil, err
+		}
+		collab.LastSeenAt, err = parseStoredTime(lastSeenAt)
+		if err != nil {
+			return nil, err
+		}
+		collaborators = append(collaborators, collab)
+	}
+	return collaborators, rows.Err()
+}
+
+func loadActivityLog(path string) ([]activityEvent, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, actor_id, action, entity_type, entity_id, summary, created_at FROM activity_log ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []activityEvent
+	for rows.Next() {
+		var (
+			event     activityEvent
+			createdAt string
+		)
+		if err := rows.Scan(&event.ID, &event.ActorID, &event.Action, &event.EntityType, &event.EntityID, &event.Summary, &createdAt); err != nil {
+			return nil, err
+		}
+		event.CreatedAt, err = parseStoredTime(createdAt)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 func loadConfig(path string) (appConfig, error) {
@@ -3218,6 +3433,461 @@ func saveState(path string, state appState) error {
 	return tx.Commit()
 }
 
+func replaceCollaborationData(path string, collaborators []collaborator, activityLog []activityEvent) error {
+	if len(collaborators) == 0 && len(activityLog) == 0 {
+		return nil
+	}
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM collaborators`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM activity_log`); err != nil {
+		return err
+	}
+	for _, collab := range collaborators {
+		if collab.ID == "" {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO collaborators (id, name, role, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
+			collab.ID,
+			fallback(collab.Name, "Local User"),
+			fallback(collab.Role, "owner"),
+			formatStoredTime(collab.CreatedAt),
+			formatStoredTime(collab.LastSeenAt),
+		); err != nil {
+			return err
+		}
+	}
+	if err := ensureCollaboratorTx(tx, localActorID); err != nil {
+		return err
+	}
+	for _, event := range activityLog {
+		if event.ID == "" {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO activity_log (id, actor_id, action, entity_type, entity_id, summary, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			event.ID,
+			normalizeActorID(event.ActorID),
+			event.Action,
+			event.EntityType,
+			event.EntityID,
+			event.Summary,
+			formatStoredTime(event.CreatedAt),
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func createMember(path string, mem member, actorID string) (member, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return member{}, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return member{}, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	if mem.ID == "" {
+		mem.ID = nextID("mem", now)
+	}
+	mem.Version = 1
+	mem.UpdatedAt = now
+	mem.UpdatedBy = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, mem.UpdatedBy); err != nil {
+		return member{}, err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO members (id, name, role, email, version, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		mem.ID, mem.Name, mem.Role, mem.Email, mem.Version, formatStoredTime(mem.UpdatedAt), mem.UpdatedBy,
+	); err != nil {
+		return member{}, err
+	}
+	if err := appendActivityTx(tx, mem.UpdatedBy, "member.created", "member", mem.ID, fmt.Sprintf("created member %s", mem.Name)); err != nil {
+		return member{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return member{}, err
+	}
+	return mem, nil
+}
+
+func updateMember(path string, mem member, expectedVersion int, actorID string) (member, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return member{}, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return member{}, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	mem.Version = normalizedVersion(expectedVersion) + 1
+	mem.UpdatedAt = now
+	mem.UpdatedBy = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, mem.UpdatedBy); err != nil {
+		return member{}, err
+	}
+	result, err := tx.Exec(
+		`UPDATE members
+		 SET name = ?, role = ?, email = ?, version = version + 1, updated_at = ?, updated_by = ?
+		 WHERE id = ? AND version = ?`,
+		mem.Name, mem.Role, mem.Email, formatStoredTime(mem.UpdatedAt), mem.UpdatedBy, mem.ID, normalizedVersion(expectedVersion),
+	)
+	if err != nil {
+		return member{}, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return member{}, err
+	} else if affected == 0 {
+		return member{}, errVersionConflict
+	}
+	if err := appendActivityTx(tx, mem.UpdatedBy, "member.updated", "member", mem.ID, fmt.Sprintf("updated member %s", mem.Name)); err != nil {
+		return member{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return member{}, err
+	}
+	return mem, nil
+}
+
+func deleteMember(path, memberID string, expectedVersion int, actorID string) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	actorID = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, actorID); err != nil {
+		return err
+	}
+	var assignedTasks int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM tasks WHERE member_id = ?`, memberID).Scan(&assignedTasks); err != nil {
+		return err
+	}
+	if assignedTasks > 0 {
+		return errors.New("delete member blocked: remove or reassign their tasks first")
+	}
+	result, err := tx.Exec(`DELETE FROM members WHERE id = ? AND version = ?`, memberID, normalizedVersion(expectedVersion))
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return errVersionConflict
+	}
+	if err := appendActivityTx(tx, actorID, "member.deleted", "member", memberID, "deleted member"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func createTask(path string, t task, actorID string) (task, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return task{}, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return task{}, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	if t.ID == "" {
+		t.ID = nextID("tsk", now)
+	}
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
+	}
+	t.Version = 1
+	t.UpdatedAt = now
+	t.UpdatedBy = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, t.UpdatedBy); err != nil {
+		return task{}, err
+	}
+	if err := insertTaskTx(tx, t); err != nil {
+		return task{}, err
+	}
+	if err := appendActivityTx(tx, t.UpdatedBy, "task.created", "task", t.ID, fmt.Sprintf("created task %s", t.Title)); err != nil {
+		return task{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return task{}, err
+	}
+	return t, nil
+}
+
+func updateTask(path string, t task, expectedVersion int, actorID string) (task, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return task{}, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return task{}, err
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	t.Version = normalizedVersion(expectedVersion) + 1
+	t.UpdatedAt = now
+	t.UpdatedBy = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, t.UpdatedBy); err != nil {
+		return task{}, err
+	}
+	tagsJSON, err := json.Marshal(t.Tags)
+	if err != nil {
+		return task{}, err
+	}
+	commentsJSON, err := json.Marshal(t.Comments)
+	if err != nil {
+		return task{}, err
+	}
+	result, err := tx.Exec(
+		`UPDATE tasks
+		 SET title = ?, member_id = ?, category = ?, priority = ?, tags_json = ?, comments_json = ?,
+		     due_date = ?, status = ?, archived = ?, created_at = ?, version = version + 1,
+		     updated_at = ?, updated_by = ?
+		 WHERE id = ? AND version = ?`,
+		t.Title,
+		t.MemberID,
+		t.Category,
+		t.Priority,
+		string(tagsJSON),
+		string(commentsJSON),
+		t.DueDate,
+		t.Status,
+		t.Archived,
+		t.CreatedAt.Format(time.RFC3339Nano),
+		formatStoredTime(t.UpdatedAt),
+		t.UpdatedBy,
+		t.ID,
+		normalizedVersion(expectedVersion),
+	)
+	if err != nil {
+		return task{}, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return task{}, err
+	} else if affected == 0 {
+		return task{}, errVersionConflict
+	}
+	if err := appendActivityTx(tx, t.UpdatedBy, "task.updated", "task", t.ID, fmt.Sprintf("updated task %s", t.Title)); err != nil {
+		return task{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return task{}, err
+	}
+	return t, nil
+}
+
+func deleteTask(path, taskID string, expectedVersion int, actorID string) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	actorID = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, actorID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM tasks WHERE id = ? AND version = ?`, taskID, normalizedVersion(expectedVersion))
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return errVersionConflict
+	}
+	if err := appendActivityTx(tx, actorID, "task.deleted", "task", taskID, "deleted task"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func setTaskArchived(path, taskID string, archived bool, expectedVersion int, actorID string) error {
+	action := "task.restored"
+	summary := "restored task"
+	if archived {
+		action = "task.archived"
+		summary = "archived task"
+	}
+	return updateTaskFields(path, taskID, expectedVersion, actorID, action, summary, func(tx *sql.Tx, now time.Time, actorID string) (sql.Result, error) {
+		return tx.Exec(
+			`UPDATE tasks
+			 SET archived = ?, version = version + 1, updated_at = ?, updated_by = ?
+			 WHERE id = ? AND version = ?`,
+			archived,
+			now.Format(time.RFC3339Nano),
+			actorID,
+			taskID,
+			normalizedVersion(expectedVersion),
+		)
+	})
+}
+
+func setTaskStatus(path, taskID, status string, expectedVersion int, actorID string) error {
+	return updateTaskFields(path, taskID, expectedVersion, actorID, "task.status_updated", "updated task status", func(tx *sql.Tx, now time.Time, actorID string) (sql.Result, error) {
+		return tx.Exec(
+			`UPDATE tasks
+			 SET status = ?, version = version + 1, updated_at = ?, updated_by = ?
+			 WHERE id = ? AND version = ?`,
+			status,
+			now.Format(time.RFC3339Nano),
+			actorID,
+			taskID,
+			normalizedVersion(expectedVersion),
+		)
+	})
+}
+
+func updateTaskFields(path, taskID string, expectedVersion int, actorID, action, summary string, update func(*sql.Tx, time.Time, string) (sql.Result, error)) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	actorID = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, actorID); err != nil {
+		return err
+	}
+	result, err := update(tx, time.Now(), actorID)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return errVersionConflict
+	}
+	if err := appendActivityTx(tx, actorID, action, "task", taskID, summary); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertTaskTx(tx *sql.Tx, t task) error {
+	t.Version = normalizedVersion(t.Version)
+	tagsJSON, err := json.Marshal(t.Tags)
+	if err != nil {
+		return err
+	}
+	commentsJSON, err := json.Marshal(t.Comments)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(
+		`INSERT INTO tasks (
+			id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at, version, updated_at, updated_by
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID,
+		t.Title,
+		t.MemberID,
+		t.Category,
+		t.Priority,
+		string(tagsJSON),
+		string(commentsJSON),
+		t.DueDate,
+		t.Status,
+		t.Archived,
+		t.CreatedAt.Format(time.RFC3339Nano),
+		t.Version,
+		formatStoredTime(t.UpdatedAt),
+		t.UpdatedBy,
+	)
+	return err
+}
+
+func appendActivityTx(tx *sql.Tx, actorID, action, entityType, entityID, summary string) error {
+	now := time.Now()
+	_, err := tx.Exec(
+		`INSERT INTO activity_log (id, actor_id, action, entity_type, entity_id, summary, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		nextID("act", now),
+		normalizeActorID(actorID),
+		action,
+		entityType,
+		entityID,
+		summary,
+		now.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func ensureCollaboratorTx(tx *sql.Tx, actorID string) error {
+	actorID = normalizeActorID(actorID)
+	now := time.Now()
+	_, err := tx.Exec(
+		`INSERT INTO collaborators (id, name, role, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
+		actorID,
+		localCollaboratorName(),
+		"owner",
+		now.Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func normalizeActorID(actorID string) string {
+	if strings.TrimSpace(actorID) == "" {
+		return localActorID
+	}
+	return strings.TrimSpace(actorID)
+}
+
 func openStorage(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -3228,12 +3898,26 @@ func openStorage(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	needsMigration, err := storageNeedsMigration(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if needsMigration {
+		if err := backupStorageFile(path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS members (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			role TEXT NOT NULL,
-			email TEXT NOT NULL
+			email TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			updated_at TEXT NOT NULL DEFAULT '',
+			updated_by TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS tasks (
 			id TEXT PRIMARY KEY,
@@ -3246,17 +3930,238 @@ func openStorage(path string) (*sql.DB, error) {
 			due_date TEXT NOT NULL,
 			status TEXT NOT NULL,
 			archived INTEGER NOT NULL,
-			created_at TEXT NOT NULL
+			created_at TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			updated_at TEXT NOT NULL DEFAULT '',
+			updated_by TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS config (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS schema_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS collaborators (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS activity_log (
+			id TEXT PRIMARY KEY,
+			actor_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			entity_type TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
+			summary TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
 	`); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := migrateStorage(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureLocalCollaborator(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+func storageNeedsMigration(db *sql.DB) (bool, error) {
+	hasMembers, err := tableExists(db, "members")
+	if err != nil {
+		return false, err
+	}
+	hasTasks, err := tableExists(db, "tasks")
+	if err != nil {
+		return false, err
+	}
+	hasConfig, err := tableExists(db, "config")
+	if err != nil {
+		return false, err
+	}
+	if !hasMembers && !hasTasks && !hasConfig {
+		return false, nil
+	}
+
+	for _, table := range []string{"schema_meta", "collaborators", "activity_log"} {
+		ok, err := tableExists(db, table)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return true, nil
+		}
+	}
+	for _, col := range []string{"version", "updated_at", "updated_by"} {
+		ok, err := columnExists(db, "members", col)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return true, nil
+		}
+		ok, err = columnExists(db, "tasks", col)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return true, nil
+		}
+	}
+
+	var version string
+	if err := db.QueryRow(`SELECT value FROM schema_meta WHERE key = ?`, storageSchemaKey).Scan(&version); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		return false, err
+	}
+	return version != fmt.Sprint(storageSchemaVer), nil
+}
+
+func backupStorageFile(path string) error {
+	if strings.TrimSpace(path) == "" || path == ":memory:" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && info.Size() == 0) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	src, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	backupPath := fmt.Sprintf("%s.bak-%s", path, time.Now().Format("20060102-150405.000000000"))
+	dst, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+	return dst.Sync()
+}
+
+func migrateStorage(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, migration := range []struct {
+		table string
+		col   string
+		def   string
+	}{
+		{"members", "version", "INTEGER NOT NULL DEFAULT 1"},
+		{"members", "updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"members", "updated_by", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "version", "INTEGER NOT NULL DEFAULT 1"},
+		{"tasks", "updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"tasks", "updated_by", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfMissing(tx, migration.table, migration.col, migration.def); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO schema_meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		storageSchemaKey,
+		fmt.Sprint(storageSchemaVer),
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func tableExists(db *sql.DB, name string) (bool, error) {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func columnExists(db queryer, table, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			kind       string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func addColumnIfMissing(tx *sql.Tx, table, column, definition string) error {
+	ok, err := columnExists(tx, table, column)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	_, err = tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+	return err
+}
+
+type queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+func ensureLocalCollaborator(db *sql.DB) error {
+	now := time.Now()
+	_, err := db.Exec(
+		`INSERT INTO collaborators (id, name, role, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
+		localActorID,
+		localCollaboratorName(),
+		"owner",
+		now.Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func localCollaboratorName() string {
+	for _, key := range []string{"PROMAG_USER", "USER", "USERNAME"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return "Local User"
 }
 
 func migrateLegacyFiles(db *sql.DB) error {
@@ -3323,15 +4228,17 @@ func replaceState(tx *sql.Tx, state appState) error {
 	}
 
 	for _, mem := range state.Members {
+		mem.Version = normalizedVersion(mem.Version)
 		if _, err := tx.Exec(
-			`INSERT INTO members (id, name, role, email) VALUES (?, ?, ?, ?)`,
-			mem.ID, mem.Name, mem.Role, mem.Email,
+			`INSERT INTO members (id, name, role, email, version, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			mem.ID, mem.Name, mem.Role, mem.Email, mem.Version, formatStoredTime(mem.UpdatedAt), mem.UpdatedBy,
 		); err != nil {
 			return err
 		}
 	}
 
 	for _, t := range state.Tasks {
+		t.Version = normalizedVersion(t.Version)
 		tagsJSON, err := json.Marshal(t.Tags)
 		if err != nil {
 			return err
@@ -3342,8 +4249,8 @@ func replaceState(tx *sql.Tx, state appState) error {
 		}
 		if _, err := tx.Exec(
 			`INSERT INTO tasks (
-				id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, title, member_id, category, priority, tags_json, comments_json, due_date, status, archived, created_at, version, updated_at, updated_by
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			t.ID,
 			t.Title,
 			t.MemberID,
@@ -3355,6 +4262,9 @@ func replaceState(tx *sql.Tx, state appState) error {
 			t.Status,
 			t.Archived,
 			t.CreatedAt.Format(time.RFC3339Nano),
+			t.Version,
+			formatStoredTime(t.UpdatedAt),
+			t.UpdatedBy,
 		); err != nil {
 			return err
 		}
@@ -3381,6 +4291,27 @@ func upsertConfig(tx *sql.Tx, key, value string) error {
 		value,
 	)
 	return err
+}
+
+func normalizedVersion(version int) int {
+	if version <= 0 {
+		return 1
+	}
+	return version
+}
+
+func parseStoredTime(value string) (time.Time, error) {
+	if strings.TrimSpace(value) == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, value)
+}
+
+func formatStoredTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.Format(time.RFC3339Nano)
 }
 
 func loadLegacyState(path string) (appState, error) {
@@ -3551,6 +4482,14 @@ func exportProjectBundle(projects []projectRecord, lastProjectID, selector, outp
 	if err != nil {
 		return projectRecord{}, fmt.Errorf("load project config: %w", err)
 	}
+	collaborators, err := loadCollaborators(project.DBPath)
+	if err != nil {
+		return projectRecord{}, fmt.Errorf("load collaborators: %w", err)
+	}
+	activityLog, err := loadActivityLog(project.DBPath)
+	if err != nil {
+		return projectRecord{}, fmt.Errorf("load activity log: %w", err)
+	}
 
 	bundle := projectExportBundle{
 		Version:    exportVersion,
@@ -3563,8 +4502,10 @@ func exportProjectBundle(projects []projectRecord, lastProjectID, selector, outp
 			CreatedAt:    project.CreatedAt,
 			LastOpenedAt: project.LastOpenedAt,
 		},
-		Config: cfg,
-		State:  state,
+		Config:        cfg,
+		State:         state,
+		Collaborators: collaborators,
+		ActivityLog:   activityLog,
 	}
 	if err := writeProjectExport(outputPath, bundle); err != nil {
 		return projectRecord{}, err
@@ -3598,6 +4539,9 @@ func importProjectBundle(registryPath, projectsBaseDir string, projects []projec
 	cfg.TaskSortMode = string(cfg.taskSortMode())
 	if err := saveConfig(project.DBPath, cfg); err != nil {
 		return projectRecord{}, fmt.Errorf("save imported config: %w", err)
+	}
+	if err := replaceCollaborationData(project.DBPath, bundle.Collaborators, bundle.ActivityLog); err != nil {
+		return projectRecord{}, fmt.Errorf("save imported collaboration data: %w", err)
 	}
 	return project, nil
 }
@@ -4047,6 +4991,7 @@ func helpManual(width int) string {
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",
+		"Older project databases are backed up to .sqlite3.bak-* before collaboration metadata is migrated.",
 		"Exported project backups are JSON files; use a .json filename, for example backups/ops.json.",
 		"CLI export/import: promag --export Ops backups/ops.json and promag --import \"Restored Ops\" backups/ops.json.",
 		"Legacy promag.sqlite3, promag-data.json, and promag-config.json are imported automatically when present.",

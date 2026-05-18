@@ -180,8 +180,10 @@ New task and quick note forms default the due date to 7 days from today. Task an
   - Stores project metadata and the last-opened project
 - `.promag/projects/*.sqlite3`
   - Stores members, tasks, and UI settings for each project
+- `.promag/projects/*.sqlite3.bak-*`
+  - Automatic timestamped backups created before older project databases are migrated
 - Exported project JSON files
-  - Store project metadata, members, tasks, and settings for backup or restore into a new local project
+  - Store project metadata, members, tasks, settings, collaborators, and activity for backup or restore into a new local project
 - Legacy `promag.sqlite3` / `promag-data.json` / `promag-config.json`
   - Imported automatically into a default project if they still exist on first run
 
