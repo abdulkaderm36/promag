@@ -63,6 +63,12 @@ promag
   - Exports a project to a portable JSON file
 - `--import <project-name> <path.json>`
   - Imports a project JSON file as a new local project with the given name
+- `--serve <project-id-or-name>`
+  - Serves a project over a token-authenticated HTTP API for collaboration clients
+- `--addr <host:port>`
+  - Address for `--serve`; defaults to `:8080`
+- `--token <token>`
+  - Bearer token for `--serve`; can also be set with `PROMAG_SERVER_TOKEN`
 
 Examples:
 
@@ -72,6 +78,7 @@ go run . --debug-hitboxes
 go run . --debug --debug-hitboxes
 go run . --export Ops backups/ops.json
 go run . --import "Restored Project" backups/ops.json
+go run . --serve Ops --addr :8080 --token "$PROMAG_SERVER_TOKEN"
 ```
 
 ## Configuration
@@ -188,6 +195,38 @@ New task and quick note forms default the due date to 7 days from today. Task an
   - Imported automatically into a default project if they still exist on first run
 
 Due dates are stored as `YYYY-MM-DD`. New tasks default to a due date 7 days from the creation date unless you change or clear the due date field.
+
+## Collaboration Server
+
+Run a local collaboration server for a project:
+
+```bash
+PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)" go run . --serve Ops --addr :8080
+```
+
+Clients must send either:
+
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-ProMag-Token: <token>
+```
+
+Main API routes:
+
+- `GET /state`: project metadata, config, tasks, members, collaborators, and activity log
+- `GET /activity`: activity log only
+- `GET /export`: project JSON export bundle
+- `POST /tasks`, `PATCH /tasks/{id}`, `DELETE /tasks/{id}`
+- `PATCH /tasks/{id}/status`, `PATCH /tasks/{id}/archive`
+- `POST /members`, `PATCH /members/{id}`, `DELETE /members/{id}`
+- `PATCH /config`
+
+Write requests use optimistic versions. Send the version last seen as `expected_version`; stale writes return HTTP `409 Conflict`.
 
 ## Developer Workflow
 

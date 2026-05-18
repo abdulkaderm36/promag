@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -401,6 +404,117 @@ func TestUpdateTaskDetectsStaleVersionAndLogsActivity(t *testing.T) {
 	if events[0].Action != "task.created" || events[1].Action != "task.updated" {
 		t.Fatalf("activity actions = %q, %q", events[0].Action, events[1].Action)
 	}
+}
+
+func TestProjectServerRequiresAuthAndHandlesTaskConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Remote Ops", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newProjectServer(project, "secret")
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/state", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	createBody := mustJSON(t, taskWriteRequest{
+		Task: task{Title: "Ship server mode", Priority: "high", Status: "open"},
+	})
+	createResp := serveJSONRequest(t, handler, http.MethodPost, "/tasks", createBody)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	var created task
+	if err := json.Unmarshal(createResp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Version != 1 || created.UpdatedBy != "manager-1" {
+		t.Fatalf("created task metadata = version %d updated_by %q", created.Version, created.UpdatedBy)
+	}
+
+	updatedTask := created
+	updatedTask.Title = "Ship authenticated server mode"
+	updateBody := mustJSON(t, taskWriteRequest{Task: updatedTask, ExpectedVersion: created.Version})
+	updateResp := serveJSONRequest(t, handler, http.MethodPatch, "/tasks/"+created.ID, updateBody)
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("update status = %d body = %s", updateResp.Code, updateResp.Body.String())
+	}
+	var updated task
+	if err := json.Unmarshal(updateResp.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 {
+		t.Fatalf("updated version = %d, want 2", updated.Version)
+	}
+
+	partialBody := mustJSON(t, taskWriteRequest{
+		Task:            task{Title: "Ship partial task patch", Priority: "medium"},
+		ExpectedVersion: updated.Version,
+	})
+	partialResp := serveJSONRequest(t, handler, http.MethodPatch, "/tasks/"+created.ID, partialBody)
+	if partialResp.Code != http.StatusOK {
+		t.Fatalf("partial update status = %d body = %s", partialResp.Code, partialResp.Body.String())
+	}
+	var partial task
+	if err := json.Unmarshal(partialResp.Body.Bytes(), &partial); err != nil {
+		t.Fatal(err)
+	}
+	if partial.CreatedAt.IsZero() || !partial.CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("partial update created_at = %v, want preserved %v", partial.CreatedAt, created.CreatedAt)
+	}
+
+	staleResp := serveJSONRequest(t, handler, http.MethodPatch, "/tasks/"+created.ID, updateBody)
+	if staleResp.Code != http.StatusConflict {
+		t.Fatalf("stale update status = %d body = %s", staleResp.Code, staleResp.Body.String())
+	}
+
+	stateResp := serveJSONRequest(t, handler, http.MethodGet, "/state", nil)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.State.Tasks) != 1 || state.State.Tasks[0].Title != "Ship partial task patch" {
+		t.Fatalf("state tasks = %#v", state.State.Tasks)
+	}
+	if len(state.ActivityLog) != 3 {
+		t.Fatalf("activity count = %d, want 3", len(state.ActivityLog))
+	}
+}
+
+func serveJSONRequest(t *testing.T, handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *bytes.Reader
+	if body == nil {
+		reader = bytes.NewReader(nil)
+	} else {
+		reader = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("X-ProMag-Actor", "manager-1")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func hasCollaborator(collaborators []collaborator, id string) bool {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -419,6 +421,9 @@ func main() {
 	debugHitboxesFlag := flag.Bool("debug-hitboxes", false, "draw mouse hit zones on screen")
 	exportFlag := flag.Bool("export", false, "export a project to JSON: --export <project-id-or-name> <output-path.json>")
 	importFlag := flag.Bool("import", false, "import JSON as a new local project: --import <project-name> <input-path.json>")
+	serveProjectFlag := flag.String("serve", "", "serve a project over HTTP: --serve <project-id-or-name> --addr :8080 --token <token>")
+	serveAddrFlag := flag.String("addr", ":8080", "address for --serve")
+	serveTokenFlag := flag.String("token", "", "bearer token for --serve; can also use PROMAG_SERVER_TOKEN")
 	flag.Parse()
 
 	mouseDebugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_MOUSE"))
@@ -439,8 +444,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "bootstrap project registry: %v\n", err)
 		os.Exit(1)
 	}
-	if *exportFlag && *importFlag {
-		fmt.Fprintln(os.Stderr, "--export and --import cannot be used together")
+	actionCount := 0
+	for _, active := range []bool{*exportFlag, *importFlag, strings.TrimSpace(*serveProjectFlag) != ""} {
+		if active {
+			actionCount++
+		}
+	}
+	if actionCount > 1 {
+		fmt.Fprintln(os.Stderr, "--export, --import, and --serve cannot be used together")
 		os.Exit(1)
 	}
 	if *exportFlag {
@@ -469,6 +480,26 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stdout, "Imported project %q\n", project.Name)
+		return
+	}
+	if strings.TrimSpace(*serveProjectFlag) != "" {
+		project, err := selectProjectForExport(projects, lastProjectID, *serveProjectFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "serve project: %v\n", err)
+			os.Exit(1)
+		}
+		token := strings.TrimSpace(*serveTokenFlag)
+		if token == "" {
+			token = strings.TrimSpace(os.Getenv("PROMAG_SERVER_TOKEN"))
+		}
+		if token == "" {
+			fmt.Fprintln(os.Stderr, "serve token is required: use --token or PROMAG_SERVER_TOKEN")
+			os.Exit(1)
+		}
+		if err := serveProject(project, *serveAddrFlag, token); err != nil {
+			fmt.Fprintf(os.Stderr, "serve project: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -3143,6 +3174,414 @@ func (m model) findMemberByName(name string) *member {
 	return nil
 }
 
+type stateResponse struct {
+	Project       exportedProjectRecord `json:"project"`
+	Config        appConfig             `json:"config"`
+	State         appState              `json:"state"`
+	Collaborators []collaborator        `json:"collaborators"`
+	ActivityLog   []activityEvent       `json:"activity_log"`
+}
+
+type taskWriteRequest struct {
+	Task            task `json:"task"`
+	ExpectedVersion int  `json:"expected_version"`
+}
+
+type taskStatusRequest struct {
+	Status          string `json:"status"`
+	ExpectedVersion int    `json:"expected_version"`
+}
+
+type taskArchiveRequest struct {
+	Archived        bool `json:"archived"`
+	ExpectedVersion int  `json:"expected_version"`
+}
+
+type memberWriteRequest struct {
+	Member          member `json:"member"`
+	ExpectedVersion int    `json:"expected_version"`
+}
+
+type configWriteRequest struct {
+	Config appConfig `json:"config"`
+}
+
+type projectServer struct {
+	project projectRecord
+	token   string
+}
+
+func serveProject(project projectRecord, addr, token string) error {
+	if _, err := loadState(project.DBPath); err != nil {
+		return err
+	}
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           newProjectServer(project, token),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	fmt.Fprintf(os.Stdout, "Serving project %q at http://%s\n", project.Name, addr)
+	return server.ListenAndServe()
+}
+
+func newProjectServer(project projectRecord, token string) http.Handler {
+	return projectServer{project: project, token: token}
+}
+
+func (s projectServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/health" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
+	switch {
+	case path == "state":
+		s.handleState(w, r)
+	case path == "activity":
+		s.handleActivity(w, r)
+	case path == "export":
+		s.handleExport(w, r)
+	case path == "config":
+		s.handleConfig(w, r)
+	case len(parts) >= 1 && parts[0] == "tasks":
+		s.handleTasks(w, r, parts)
+	case len(parts) >= 1 && parts[0] == "members":
+		s.handleMembers(w, r, parts)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s projectServer) authorized(r *http.Request) bool {
+	if s.token == "" {
+		return false
+	}
+	token := strings.TrimSpace(r.Header.Get("X-ProMag-Token"))
+	if token == "" {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			token = strings.TrimSpace(auth[len("bearer "):])
+		}
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) == 1
+}
+
+func (s projectServer) actorID(r *http.Request) string {
+	return normalizeActorID(r.Header.Get("X-ProMag-Actor"))
+}
+
+func (s projectServer) handleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	response, err := s.stateResponse()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s projectServer) handleActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	events, err := loadActivityLog(s.project.DBPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (s projectServer) handleExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	bundle, err := buildProjectExportBundle(s.project)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, bundle)
+}
+
+func (s projectServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req configWriteRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := saveConfig(s.project.DBPath, req.Config); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cfg, err := loadConfig(s.project.DBPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s projectServer) handleTasks(w http.ResponseWriter, r *http.Request, parts []string) {
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodPost:
+		var req taskWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		t, err := normalizeAPITask(req.Task)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		created, err := createTask(s.project.DBPath, t, s.actorID(r))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	case len(parts) == 2 && r.Method == http.MethodPatch:
+		var req taskWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		existing, err := loadTaskByID(s.project.DBPath, parts[1])
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		if req.Task.CreatedAt.IsZero() {
+			req.Task.CreatedAt = existing.CreatedAt
+		}
+		if strings.TrimSpace(req.Task.Status) == "" {
+			req.Task.Status = existing.Status
+		}
+		t, err := normalizeAPITask(req.Task)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		t.ID = parts[1]
+		updated, err := updateTask(s.project.DBPath, t, req.ExpectedVersion, s.actorID(r))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+	case len(parts) == 2 && r.Method == http.MethodDelete:
+		var req taskWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if err := deleteTask(s.project.DBPath, parts[1], req.ExpectedVersion, s.actorID(r)); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case len(parts) == 3 && parts[2] == "status" && r.Method == http.MethodPatch:
+		var req taskStatusRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		status := strings.TrimSpace(req.Status)
+		if status == "" {
+			writeError(w, http.StatusBadRequest, "status is required")
+			return
+		}
+		if err := setTaskStatus(s.project.DBPath, parts[1], status, req.ExpectedVersion, s.actorID(r)); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": status})
+	case len(parts) == 3 && parts[2] == "archive" && r.Method == http.MethodPatch:
+		var req taskArchiveRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if err := setTaskArchived(s.project.DBPath, parts[1], req.Archived, req.ExpectedVersion, s.actorID(r)); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"archived": req.Archived})
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s projectServer) handleMembers(w http.ResponseWriter, r *http.Request, parts []string) {
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodPost:
+		var req memberWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		mem, err := normalizeAPIMember(s.project.DBPath, req.Member, "")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		created, err := createMember(s.project.DBPath, mem, s.actorID(r))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	case len(parts) == 2 && r.Method == http.MethodPatch:
+		var req memberWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		mem, err := normalizeAPIMember(s.project.DBPath, req.Member, parts[1])
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		mem.ID = parts[1]
+		updated, err := updateMember(s.project.DBPath, mem, req.ExpectedVersion, s.actorID(r))
+		if err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+	case len(parts) == 2 && r.Method == http.MethodDelete:
+		var req memberWriteRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if err := deleteMember(s.project.DBPath, parts[1], req.ExpectedVersion, s.actorID(r)); err != nil {
+			writeStorageError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s projectServer) stateResponse() (stateResponse, error) {
+	state, err := loadState(s.project.DBPath)
+	if err != nil {
+		return stateResponse{}, err
+	}
+	cfg, err := loadConfig(s.project.DBPath)
+	if err != nil {
+		return stateResponse{}, err
+	}
+	collaborators, err := loadCollaborators(s.project.DBPath)
+	if err != nil {
+		return stateResponse{}, err
+	}
+	activityLog, err := loadActivityLog(s.project.DBPath)
+	if err != nil {
+		return stateResponse{}, err
+	}
+	return stateResponse{
+		Project:       exportProjectRecord(s.project),
+		Config:        cfg,
+		State:         state,
+		Collaborators: collaborators,
+		ActivityLog:   activityLog,
+	}, nil
+}
+
+func normalizeAPITask(t task) (task, error) {
+	t.Title = strings.TrimSpace(t.Title)
+	if t.Title == "" {
+		return task{}, errors.New("task title is required")
+	}
+	t.Priority = normalizePriority(t.Priority)
+	if t.Priority == "" {
+		t.Priority = "medium"
+	}
+	if strings.TrimSpace(t.Status) == "" {
+		t.Status = "open"
+	}
+	dueDate, err := normalizeDueInput(t.DueDate)
+	if err != nil {
+		return task{}, err
+	}
+	t.DueDate = dueDate
+	return t, nil
+}
+
+func normalizeAPIMember(dbPath string, mem member, editingID string) (member, error) {
+	mem.Name = strings.TrimSpace(mem.Name)
+	mem.Role = strings.TrimSpace(mem.Role)
+	mem.Email = strings.TrimSpace(mem.Email)
+	if mem.Name == "" {
+		return member{}, errors.New("member name is required")
+	}
+	state, err := loadState(dbPath)
+	if err != nil {
+		return member{}, err
+	}
+	for _, existing := range state.Members {
+		if strings.EqualFold(existing.Name, mem.Name) && existing.ID != editingID {
+			return member{}, fmt.Errorf("member %q already exists", mem.Name)
+		}
+	}
+	return mem, nil
+}
+
+func loadTaskByID(dbPath, id string) (task, error) {
+	state, err := loadState(dbPath)
+	if err != nil {
+		return task{}, err
+	}
+	for _, t := range state.Tasks {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	return task{}, sql.ErrNoRows
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return false
+	}
+	return true
+}
+
+func writeStorageError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errVersionConflict):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, sql.ErrNoRows):
+		writeError(w, http.StatusNotFound, "not found")
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
 func (m model) taskByID(id string) *task {
 	for _, t := range m.state.Tasks {
 		if t.ID == id {
@@ -4474,43 +4913,54 @@ func exportProjectBundle(projects []projectRecord, lastProjectID, selector, outp
 	if err != nil {
 		return projectRecord{}, err
 	}
-	state, err := loadState(project.DBPath)
+	bundle, err := buildProjectExportBundle(project)
 	if err != nil {
-		return projectRecord{}, fmt.Errorf("load project state: %w", err)
-	}
-	cfg, err := loadConfig(project.DBPath)
-	if err != nil {
-		return projectRecord{}, fmt.Errorf("load project config: %w", err)
-	}
-	collaborators, err := loadCollaborators(project.DBPath)
-	if err != nil {
-		return projectRecord{}, fmt.Errorf("load collaborators: %w", err)
-	}
-	activityLog, err := loadActivityLog(project.DBPath)
-	if err != nil {
-		return projectRecord{}, fmt.Errorf("load activity log: %w", err)
-	}
-
-	bundle := projectExportBundle{
-		Version:    exportVersion,
-		ExportedAt: time.Now(),
-		Project: exportedProjectRecord{
-			ID:           project.ID,
-			Name:         project.Name,
-			Type:         project.Type,
-			RemoteURL:    project.RemoteURL,
-			CreatedAt:    project.CreatedAt,
-			LastOpenedAt: project.LastOpenedAt,
-		},
-		Config:        cfg,
-		State:         state,
-		Collaborators: collaborators,
-		ActivityLog:   activityLog,
+		return projectRecord{}, err
 	}
 	if err := writeProjectExport(outputPath, bundle); err != nil {
 		return projectRecord{}, err
 	}
 	return project, nil
+}
+
+func buildProjectExportBundle(project projectRecord) (projectExportBundle, error) {
+	state, err := loadState(project.DBPath)
+	if err != nil {
+		return projectExportBundle{}, fmt.Errorf("load project state: %w", err)
+	}
+	cfg, err := loadConfig(project.DBPath)
+	if err != nil {
+		return projectExportBundle{}, fmt.Errorf("load project config: %w", err)
+	}
+	collaborators, err := loadCollaborators(project.DBPath)
+	if err != nil {
+		return projectExportBundle{}, fmt.Errorf("load collaborators: %w", err)
+	}
+	activityLog, err := loadActivityLog(project.DBPath)
+	if err != nil {
+		return projectExportBundle{}, fmt.Errorf("load activity log: %w", err)
+	}
+
+	return projectExportBundle{
+		Version:       exportVersion,
+		ExportedAt:    time.Now(),
+		Project:       exportProjectRecord(project),
+		Config:        cfg,
+		State:         state,
+		Collaborators: collaborators,
+		ActivityLog:   activityLog,
+	}, nil
+}
+
+func exportProjectRecord(project projectRecord) exportedProjectRecord {
+	return exportedProjectRecord{
+		ID:           project.ID,
+		Name:         project.Name,
+		Type:         project.Type,
+		RemoteURL:    project.RemoteURL,
+		CreatedAt:    project.CreatedAt,
+		LastOpenedAt: project.LastOpenedAt,
+	}
 }
 
 func importProjectBundle(registryPath, projectsBaseDir string, projects []projectRecord, inputPath, importName string) (projectRecord, error) {
@@ -4988,6 +5438,7 @@ func helpManual(width int) string {
 		"Press p to switch projects or create a new one inside the TUI.",
 		"ProMag remembers the last project you opened and restores it on the next launch.",
 		"Remote projects currently store remote_url metadata and still use a local cache DB.",
+		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
 		"",
 		"Data",
 		"Project registry and project databases live under .promag/ in this project directory.",
