@@ -284,6 +284,35 @@ Cloud API routes are project-scoped:
 
 To connect a TUI client to a cloud project, create or edit a `remote` project and set its remote URL to `http://localhost:8080/projects/{id}`. Use the deployed host name instead of `localhost` when the hub is running on a server, and set `PROMAG_REMOTE_TOKEN` to that project's token.
 
+### Docker Deployment
+
+The repository includes a `Dockerfile` and `docker-compose.yml` for running the cloud hub as a service.
+
+Build and start the hub:
+
+```bash
+export PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)"
+docker compose up --build -d
+```
+
+The compose file stores cloud project data in the named Docker volume `promag-cloud-data`, mounted at `/data` inside the container. Do not run the cloud hub without a persistent volume, or project databases will be lost when the container is replaced.
+
+Create or import cloud projects by running one-off commands against the same volume:
+
+```bash
+docker compose run --rm promag-cloud --cloud-create --data-dir /data Ops
+docker compose run --rm -v "$PWD/backups:/imports:ro" promag-cloud --cloud-import --data-dir /data Ops /imports/ops.json
+docker compose run --rm promag-cloud --cloud-token --data-dir /data Ops
+```
+
+For a remote client, use:
+
+```bash
+PROMAG_REMOTE_TOKEN="<project-token>" promag
+```
+
+Then create or edit a `remote` project and set the remote URL to `http://<host>:8080/projects/<project-id>`.
+
 ## Developer Workflow
 
 Useful commands while working on the app:

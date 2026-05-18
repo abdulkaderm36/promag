@@ -1,0 +1,14 @@
+services:
+  promag-cloud:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    environment:
+      PROMAG_SERVER_TOKEN: ${PROMAG_SERVER_TOKEN:?set PROMAG_SERVER_TOKEN before starting the cloud hub}
+    volumes:
+      - promag-cloud-data:/data
+    restart: unless-stopped
+
+volumes:
+  promag-cloud-data:

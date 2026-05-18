@@ -1,0 +1,11 @@
+.git
+.promag
+.promag-cloud
+promag
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.bak-*
+backups
+coverage.out
+Dockerfile
+docker-compose.yml
