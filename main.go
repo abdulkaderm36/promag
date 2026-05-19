@@ -90,6 +90,14 @@ const (
 	projectTypeRemote projectType = "remote"
 )
 
+type remoteConnectionStatus string
+
+const (
+	remoteStatusUnknown   remoteConnectionStatus = ""
+	remoteStatusConnected remoteConnectionStatus = "connected"
+	remoteStatusFailed    remoteConnectionStatus = "failed"
+)
+
 type zone struct {
 	X1 int
 	Y1 int
@@ -280,10 +288,13 @@ type model struct {
 	height  int
 	bodyTop int
 
-	activeView viewMode
-	cursor     map[viewMode]int
-	lastStatus string
-	statusAt   time.Time
+	activeView      viewMode
+	cursor          map[viewMode]int
+	lastStatus      string
+	statusAt        time.Time
+	remoteStatus    remoteConnectionStatus
+	remoteLastSync  time.Time
+	remoteLastError string
 
 	tabZones     []zone
 	rowZones     []zone
@@ -775,6 +786,9 @@ func newModel(registryPath, projectsBaseDir string, project projectRecord, proje
 		detailScroll:    map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 		listOffset:      map[viewMode]int{viewTasks: 0, viewMembers: 0, viewDates: 0, viewArchive: 0, viewHelp: 0},
 	}
+	if project.Type == projectTypeRemote && project.ID != "" {
+		model.markRemoteSynced(time.Now())
+	}
 	model.refreshMemberSuggestions()
 	if len(projects) == 0 {
 		model.openProjectCreateForm(true)
@@ -825,10 +839,12 @@ func (m model) handleRemoteRefresh(msg remoteRefreshMsg) (tea.Model, tea.Cmd) {
 	}
 	next := m.remoteRefreshCmd()
 	if msg.Err != nil {
+		m.markRemoteFailed(msg.Err)
 		m.setStatus("Remote refresh failed: " + msg.Err.Error())
 		return m, next
 	}
 	m.applyRemoteState(msg.Response)
+	m.markRemoteSynced(time.Now())
 	return m, next
 }
 
@@ -841,6 +857,27 @@ func (m *model) applyRemoteState(response stateResponse) {
 	for _, view := range []viewMode{viewTasks, viewMembers, viewDates, viewArchive} {
 		m.clampViewCursor(view)
 	}
+}
+
+func (m *model) markRemoteSynced(now time.Time) {
+	m.remoteStatus = remoteStatusConnected
+	m.remoteLastSync = now
+	m.remoteLastError = ""
+}
+
+func (m *model) markRemoteFailed(err error) {
+	m.remoteStatus = remoteStatusFailed
+	if err == nil {
+		m.remoteLastError = "unknown error"
+		return
+	}
+	m.remoteLastError = err.Error()
+}
+
+func (m *model) clearRemoteStatus() {
+	m.remoteStatus = remoteStatusUnknown
+	m.remoteLastSync = time.Time{}
+	m.remoteLastError = ""
 }
 
 func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -1646,7 +1683,8 @@ func (m model) renderStatus() string {
 	frameWidth := max(20, m.width)
 	contentWidth := max(20, frameWidth-ui.statusFrame.GetHorizontalFrameSize())
 	left := ui.title.Render(truncate(m.lastStatus, max(10, contentWidth/2)))
-	center := ui.subtitle.Render(truncate(m.filterSummary(), max(16, contentWidth/3)))
+	secondary := m.secondaryStatusSummary(time.Now())
+	center := ui.subtitle.Render(truncate(secondary, max(16, contentWidth/3)))
 	hints := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		ui.keycap.Render(":"),
@@ -1662,7 +1700,7 @@ func (m model) renderStatus() string {
 	)
 	right := hints
 	leftBlock := left
-	if strings.TrimSpace(m.filter.Text+m.filter.Member+m.filter.Due) != "" {
+	if strings.TrimSpace(secondary) != "" {
 		leftBlock = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", center)
 	}
 	row := joinHeaderLine(leftBlock, right, contentWidth)
@@ -2535,6 +2573,11 @@ func (m *model) activateProject(project projectRecord) error {
 	m.config = cfg
 	m.collaborators = collaborators
 	m.activityLog = activityLog
+	if selected.Type == projectTypeRemote {
+		m.markRemoteSynced(time.Now())
+	} else {
+		m.clearRemoteStatus()
+	}
 	m.projects = projects
 	m.currentProject = selected
 	m.filter = filterState{}
@@ -3421,6 +3464,37 @@ func (m model) filterSummary() string {
 		return "No filters active."
 	}
 	return "Filters active: " + strings.Join(parts, ", ")
+}
+
+func (m model) secondaryStatusSummary(now time.Time) string {
+	parts := []string{}
+	if strings.TrimSpace(m.filter.Text+m.filter.Member+m.filter.Due) != "" {
+		parts = append(parts, m.filterSummary())
+	}
+	if remote := m.remoteStatusSummary(now); remote != "" {
+		parts = append(parts, remote)
+	}
+	return strings.Join(parts, "  |  ")
+}
+
+func (m model) remoteStatusSummary(now time.Time) string {
+	if m.currentProject.Type != projectTypeRemote {
+		return ""
+	}
+	switch m.remoteStatus {
+	case remoteStatusConnected:
+		if m.remoteLastSync.IsZero() {
+			return "Remote connected"
+		}
+		return "Remote connected · synced " + relativeTime(now, m.remoteLastSync)
+	case remoteStatusFailed:
+		if strings.TrimSpace(m.remoteLastError) == "" {
+			return "Remote failed"
+		}
+		return "Remote failed · " + m.remoteLastError
+	default:
+		return "Remote pending"
+	}
 }
 
 func (m model) memberName(memberID string) string {
@@ -4404,12 +4478,14 @@ func (m *model) reloadState() error {
 	if m.currentProject.Type == projectTypeRemote {
 		response, err := fetchAndCacheRemoteProject(m.currentProject)
 		if err != nil {
+			m.markRemoteFailed(err)
 			return err
 		}
 		state = response.State
 		m.config = response.Config
 		m.collaborators = response.Collaborators
 		m.activityLog = response.ActivityLog
+		m.markRemoteSynced(time.Now())
 	} else {
 		loaded, err := loadState(m.dbPath)
 		if err != nil {

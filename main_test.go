@@ -814,6 +814,51 @@ func TestHandleRemoteRefreshAppliesLatestState(t *testing.T) {
 	if len(got.activityLog) != 1 || got.activityLog[0].ID != "act-1" {
 		t.Fatalf("activity log = %#v", got.activityLog)
 	}
+	if got.remoteStatus != remoteStatusConnected {
+		t.Fatalf("remote status = %q, want connected", got.remoteStatus)
+	}
+	if got.remoteLastSync.IsZero() {
+		t.Fatal("remote last sync was not set")
+	}
+	if got.remoteLastError != "" {
+		t.Fatalf("remote last error = %q, want empty", got.remoteLastError)
+	}
+}
+
+func TestHandleRemoteRefreshTracksFailure(t *testing.T) {
+	project := projectRecord{ID: "remote-1", Name: "Remote", Type: projectTypeRemote}
+	m := newModel("", "", project, []projectRecord{project}, appState{}, defaultConfig())
+	m.markRemoteSynced(time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC))
+
+	updated, _ := m.handleRemoteRefresh(remoteRefreshMsg{ProjectID: project.ID, Err: errors.New("server down")})
+	got := updated.(model)
+	if got.remoteStatus != remoteStatusFailed {
+		t.Fatalf("remote status = %q, want failed", got.remoteStatus)
+	}
+	if got.remoteLastError != "server down" {
+		t.Fatalf("remote last error = %q, want server down", got.remoteLastError)
+	}
+	if got.remoteLastSync.IsZero() {
+		t.Fatal("remote last sync should keep the previous successful sync time")
+	}
+}
+
+func TestRemoteStatusSummary(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	m := model{
+		currentProject: projectRecord{Type: projectTypeRemote},
+		remoteStatus:   remoteStatusConnected,
+		remoteLastSync: now.Add(-2 * time.Minute),
+	}
+	if got := m.remoteStatusSummary(now); !strings.Contains(got, "Remote connected") || !strings.Contains(got, "2m ago") {
+		t.Fatalf("remote status summary = %q", got)
+	}
+
+	m.remoteStatus = remoteStatusFailed
+	m.remoteLastError = "timeout"
+	if got := m.remoteStatusSummary(now); !strings.Contains(got, "Remote failed") || !strings.Contains(got, "timeout") {
+		t.Fatalf("remote status summary = %q", got)
+	}
 }
 
 func TestActiveCollaboratorCountUsesLastSeenWindow(t *testing.T) {
