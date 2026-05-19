@@ -713,6 +713,67 @@ func TestCloudServerImportsProjectBundle(t *testing.T) {
 	}
 }
 
+func TestProjectAccessTokensCanBeMultipleAndRevoked(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	project, err := createCloudProject(registryPath, projectsBaseDir, nil, "Tokened")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, firstRecord, firstToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondRecord, secondToken, err := createProjectAccessToken(registryPath, project.ID, "Manager Two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := loadProjectAccessTokens(registryPath, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 2 {
+		t.Fatalf("tokens = %#v, want two", tokens)
+	}
+
+	handler := newCloudServer(registryPath, projectsBaseDir, "admin-secret")
+	req := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/state", nil)
+	req.Header.Set("Authorization", "Bearer "+firstToken)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("first token status = %d body = %s", resp.Code, resp.Body.String())
+	}
+
+	revoked, err := revokeProjectAccessToken(registryPath, firstRecord.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoked.RevokedAt.IsZero() {
+		t.Fatalf("revoked token = %#v, want revoked_at", revoked)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/state", nil)
+	req.Header.Set("Authorization", "Bearer "+firstToken)
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked token status = %d body = %s, want unauthorized", resp.Code, resp.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/state", nil)
+	req.Header.Set("Authorization", "Bearer "+secondToken)
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("second token status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	if secondRecord.Label != "Manager Two" {
+		t.Fatalf("second token label = %q, want Manager Two", secondRecord.Label)
+	}
+}
+
 func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
@@ -728,6 +789,10 @@ func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	if _, err := createTask(project.DBPath, task{Title: "Backed up task", Priority: "medium", Status: "open"}, "manager-1"); err != nil {
 		t.Fatal(err)
 	}
+	_, namedToken, rawNamedToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	backupPath := filepath.Join(dir, "cloud-backup.json")
 	if err := backupCloudProjects(registryPath, backupPath); err != nil {
@@ -739,6 +804,9 @@ func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	}
 	if bytes.Contains(backupData, []byte(projectToken)) {
 		t.Fatal("cloud backup contained raw project token")
+	}
+	if bytes.Contains(backupData, []byte(rawNamedToken)) {
+		t.Fatal("cloud backup contained raw named token")
 	}
 
 	restoreRegistryPath := filepath.Join(dir, ".promag-cloud-restored", registryFile)
@@ -764,6 +832,13 @@ func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	if restored.AccessTokenHash != project.AccessTokenHash {
 		t.Fatalf("restored token hash = %q, want %q", restored.AccessTokenHash, project.AccessTokenHash)
 	}
+	restoredTokens, err := loadProjectAccessTokens(restoreRegistryPath, restored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredTokens) != 1 || restoredTokens[0].ID != namedToken.ID {
+		t.Fatalf("restored tokens = %#v, want named token %s", restoredTokens, namedToken.ID)
+	}
 	state, err := loadState(restored.DBPath)
 	if err != nil {
 		t.Fatal(err)
@@ -779,6 +854,13 @@ func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("restored project token status = %d body = %s", resp.Code, resp.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/projects/"+restored.ID+"/state", nil)
+	req.Header.Set("Authorization", "Bearer "+rawNamedToken)
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("restored named token status = %d body = %s", resp.Code, resp.Body.String())
 	}
 }
 

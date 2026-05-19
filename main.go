@@ -189,6 +189,15 @@ type projectRecord struct {
 	LastOpenedAt    time.Time
 }
 
+type projectAccessToken struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id"`
+	Label     string    `json:"label"`
+	TokenHash string    `json:"token_hash"`
+	CreatedAt time.Time `json:"created_at"`
+	RevokedAt time.Time `json:"revoked_at,omitempty"`
+}
+
 type projectExportBundle struct {
 	Version       int                   `json:"version"`
 	ExportedAt    time.Time             `json:"exported_at"`
@@ -207,6 +216,7 @@ type cloudBackupBundle struct {
 
 type cloudProjectBackup struct {
 	Project       cloudProjectBackupRecord `json:"project"`
+	Tokens        []projectAccessToken     `json:"tokens,omitempty"`
 	Config        appConfig                `json:"config"`
 	State         appState                 `json:"state"`
 	Collaborators []collaborator           `json:"collaborators,omitempty"`
@@ -473,7 +483,10 @@ func main() {
 	cloudFlag := flag.Bool("cloud", false, "serve all projects from a cloud data directory: --cloud --addr :8080 --token <token>")
 	cloudCreateFlag := flag.Bool("cloud-create", false, "create a cloud project: --cloud-create <project-name>")
 	cloudImportFlag := flag.Bool("cloud-import", false, "import JSON into the cloud data directory: --cloud-import <project-name> <input-path.json>")
-	cloudTokenFlag := flag.String("cloud-token", "", "rotate and print a cloud project access token: --cloud-token <project-id-or-name>")
+	cloudTokenFlag := flag.String("cloud-token", "", "create and print a cloud project access token: --cloud-token <project-id-or-name>")
+	cloudTokenLabelFlag := flag.String("token-label", "", "label for --cloud-token")
+	cloudListTokensFlag := flag.String("cloud-tokens", "", "list cloud project access tokens: --cloud-tokens <project-id-or-name>")
+	cloudRevokeTokenFlag := flag.String("cloud-revoke-token", "", "revoke a cloud project access token by token ID")
 	cloudBackupFlag := flag.String("cloud-backup", "", "back up all cloud projects to JSON: --cloud-backup <output-path.json>")
 	cloudRestoreFlag := flag.String("cloud-restore", "", "restore all cloud projects from JSON into an empty cloud data directory: --cloud-restore <input-path.json>")
 	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for cloud commands")
@@ -493,6 +506,8 @@ func main() {
 		*cloudCreateFlag,
 		*cloudImportFlag,
 		strings.TrimSpace(*cloudTokenFlag) != "",
+		strings.TrimSpace(*cloudListTokensFlag) != "",
+		strings.TrimSpace(*cloudRevokeTokenFlag) != "",
 		strings.TrimSpace(*cloudBackupFlag) != "",
 		strings.TrimSpace(*cloudRestoreFlag) != "",
 	} {
@@ -501,7 +516,7 @@ func main() {
 		}
 	}
 	if cloudActionCount > 1 {
-		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, --cloud-token, --cloud-backup, and --cloud-restore cannot be used together")
+		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, --cloud-token, --cloud-tokens, --cloud-revoke-token, --cloud-backup, and --cloud-restore cannot be used together")
 		os.Exit(1)
 	}
 	if cloudActionCount > 0 {
@@ -527,13 +542,14 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stdout, "Created cloud project %q (%s)\n", project.Name, project.ID)
 			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
 			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
 			return
 		}
@@ -548,13 +564,14 @@ func main() {
 				fmt.Fprintf(os.Stderr, "import cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stdout, "Imported cloud project %q (%s)\n", project.Name, project.ID)
 			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
+			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
 			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
 			return
 		}
@@ -564,13 +581,44 @@ func main() {
 				fmt.Fprintf(os.Stderr, "select cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, projectToken, err := rotateProjectAccessToken(cloudRegistryPath, project.ID)
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, *cloudTokenLabelFlag)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "rotate cloud project token: %v\n", err)
+				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stdout, "Rotated cloud project token for %q (%s)\n", project.Name, project.ID)
+			fmt.Fprintf(os.Stdout, "Created cloud project token for %q (%s)\n", project.Name, project.ID)
+			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
 			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			return
+		}
+		if strings.TrimSpace(*cloudListTokensFlag) != "" {
+			project, err := selectProjectForExport(projects, "", *cloudListTokensFlag)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "select cloud project: %v\n", err)
+				os.Exit(1)
+			}
+			tokens, err := loadProjectAccessTokens(cloudRegistryPath, project.ID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "list cloud project tokens: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Tokens for %q (%s):\n", project.Name, project.ID)
+			for _, token := range tokens {
+				status := "active"
+				if !token.RevokedAt.IsZero() {
+					status = "revoked"
+				}
+				fmt.Fprintf(os.Stdout, "%s\t%s\t%s\t%s\n", token.ID, fallback(token.Label, "unlabeled"), status, token.CreatedAt.Format(time.RFC3339))
+			}
+			return
+		}
+		if strings.TrimSpace(*cloudRevokeTokenFlag) != "" {
+			tokenRecord, err := revokeProjectAccessToken(cloudRegistryPath, *cloudRevokeTokenFlag)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "revoke cloud project token: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Revoked cloud project token %s (%s)\n", tokenRecord.ID, fallback(tokenRecord.Label, "unlabeled"))
 			return
 		}
 		if strings.TrimSpace(*cloudBackupFlag) != "" {
@@ -3653,6 +3701,7 @@ type projectImportRequest struct {
 
 type cloudProjectResponse struct {
 	Project exportedProjectRecord `json:"project"`
+	TokenID string                `json:"token_id,omitempty"`
 	Token   string                `json:"token,omitempty"`
 }
 
@@ -3729,12 +3778,12 @@ func (s cloudServer) handleProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		project, token, err := rotateProjectAccessToken(s.registryPath, project.ID)
+		project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), Token: token})
+		writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), TokenID: tokenRecord.ID, Token: token})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -3771,12 +3820,12 @@ func (s cloudServer) handleProjectImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	project, token, err := rotateProjectAccessToken(s.registryPath, project.ID)
+	project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), Token: token})
+	writeJSON(w, http.StatusCreated, cloudProjectResponse{Project: exportProjectRecord(project), TokenID: tokenRecord.ID, Token: token})
 }
 
 func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request, projectID string, remainder []string) {
@@ -3811,14 +3860,16 @@ func (s cloudServer) authorizedForProject(r *http.Request, project projectRecord
 	if authorizedToken(r, s.token) {
 		return true
 	}
-	if project.AccessTokenHash == "" {
-		return false
-	}
 	token := requestToken(r)
 	if token == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(hashToken(token)), []byte(project.AccessTokenHash)) == 1
+	tokenHash := hashToken(token)
+	if project.AccessTokenHash != "" && subtle.ConstantTimeCompare([]byte(tokenHash), []byte(project.AccessTokenHash)) == 1 {
+		return true
+	}
+	ok, err := projectAccessTokenActive(s.registryPath, project.ID, tokenHash)
+	return err == nil && ok
 }
 
 func (s cloudServer) projectByID(projectID string) (projectRecord, error) {
@@ -6068,8 +6119,13 @@ func backupCloudProjects(registryPath, outputPath string) error {
 		if err != nil {
 			return fmt.Errorf("build backup for %q: %w", project.Name, err)
 		}
+		tokens, err := loadProjectAccessTokens(registryPath, project.ID)
+		if err != nil {
+			return fmt.Errorf("load tokens for %q: %w", project.Name, err)
+		}
 		backup.Projects = append(backup.Projects, cloudProjectBackup{
 			Project:       exportCloudProjectRecord(project),
+			Tokens:        tokens,
 			Config:        bundle.Config,
 			State:         bundle.State,
 			Collaborators: bundle.Collaborators,
@@ -6166,6 +6222,12 @@ func restoreCloudProject(registryPath string, project projectRecord, backup clou
 	if err := replaceCollaborationData(project.DBPath, backup.Collaborators, backup.ActivityLog); err != nil {
 		return fmt.Errorf("save restored collaboration data: %w", err)
 	}
+	for _, token := range backup.Tokens {
+		token.ProjectID = project.ID
+		if err := insertProjectAccessToken(registryPath, token); err != nil {
+			return fmt.Errorf("restore project token %q: %w", token.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -6204,6 +6266,177 @@ func rotateProjectAccessToken(registryPath, projectID string) (projectRecord, st
 		}
 	}
 	return projectRecord{}, "", errors.New("project not found after token rotation")
+}
+
+func createProjectAccessToken(registryPath, projectID, label string) (projectRecord, projectAccessToken, string, error) {
+	project, err := projectByIDFromRegistry(registryPath, projectID)
+	if err != nil {
+		return projectRecord{}, projectAccessToken{}, "", err
+	}
+	token, err := newAccessToken()
+	if err != nil {
+		return projectRecord{}, projectAccessToken{}, "", err
+	}
+	now := time.Now()
+	record := projectAccessToken{
+		ID:        nextID("tok", now),
+		ProjectID: projectID,
+		Label:     strings.TrimSpace(label),
+		TokenHash: hashToken(token),
+		CreatedAt: now,
+	}
+	if record.Label == "" {
+		record.Label = "default"
+	}
+	if err := insertProjectAccessToken(registryPath, record); err != nil {
+		return projectRecord{}, projectAccessToken{}, "", err
+	}
+	return project, record, token, nil
+}
+
+func insertProjectAccessToken(registryPath string, token projectAccessToken) error {
+	if strings.TrimSpace(token.ID) == "" {
+		return errors.New("token ID is required")
+	}
+	if strings.TrimSpace(token.ProjectID) == "" {
+		return errors.New("token project ID is required")
+	}
+	if strings.TrimSpace(token.TokenHash) == "" {
+		return errors.New("token hash is required")
+	}
+	if token.CreatedAt.IsZero() {
+		token.CreatedAt = time.Now()
+	}
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(
+		`INSERT INTO project_tokens (id, project_id, label, token_hash, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		token.ID,
+		token.ProjectID,
+		token.Label,
+		token.TokenHash,
+		token.CreatedAt.Format(time.RFC3339Nano),
+		formatStoredTime(token.RevokedAt),
+	)
+	return err
+}
+
+func revokeProjectAccessToken(registryPath, tokenID string) (projectAccessToken, error) {
+	tokenID = strings.TrimSpace(tokenID)
+	if tokenID == "" {
+		return projectAccessToken{}, errors.New("token ID is required")
+	}
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	defer db.Close()
+	now := time.Now()
+	result, err := db.Exec(`UPDATE project_tokens SET revoked_at = ? WHERE id = ? AND revoked_at = ''`, now.Format(time.RFC3339Nano), tokenID)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	if affected == 0 {
+		return projectAccessToken{}, fmt.Errorf("active token %q was not found", tokenID)
+	}
+	return loadProjectAccessTokenByID(registryPath, tokenID)
+}
+
+func projectAccessTokenActive(registryPath, projectID, tokenHash string) (bool, error) {
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM project_tokens WHERE project_id = ? AND token_hash = ? AND revoked_at = ''`,
+		projectID,
+		tokenHash,
+	).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func loadProjectAccessTokenByID(registryPath, tokenID string) (projectAccessToken, error) {
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT id, project_id, label, token_hash, created_at, revoked_at FROM project_tokens WHERE id = ?`, tokenID)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	defer rows.Close()
+	tokens, err := scanProjectAccessTokens(rows)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	if len(tokens) == 0 {
+		return projectAccessToken{}, fmt.Errorf("token %q was not found", tokenID)
+	}
+	return tokens[0], nil
+}
+
+func loadProjectAccessTokens(registryPath, projectID string) ([]projectAccessToken, error) {
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT id, project_id, label, token_hash, created_at, revoked_at FROM project_tokens WHERE project_id = ? ORDER BY created_at ASC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanProjectAccessTokens(rows)
+}
+
+func scanProjectAccessTokens(rows *sql.Rows) ([]projectAccessToken, error) {
+	var tokens []projectAccessToken
+	for rows.Next() {
+		var (
+			token     projectAccessToken
+			createdAt string
+			revokedAt string
+		)
+		if err := rows.Scan(&token.ID, &token.ProjectID, &token.Label, &token.TokenHash, &createdAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		var err error
+		token.CreatedAt, err = parseStoredTime(createdAt)
+		if err != nil {
+			return nil, err
+		}
+		token.RevokedAt, err = parseStoredTime(revokedAt)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens, rows.Err()
+}
+
+func projectByIDFromRegistry(registryPath, projectID string) (projectRecord, error) {
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		return projectRecord{}, err
+	}
+	for _, project := range projects {
+		if project.ID == projectID {
+			return project, nil
+		}
+	}
+	return projectRecord{}, fmt.Errorf("project %q was not found", projectID)
 }
 
 func newAccessToken() (string, error) {
@@ -6468,6 +6701,14 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS project_tokens (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL,
+			label TEXT NOT NULL,
+			token_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT ''
+		);
 	`); err != nil {
 		db.Close()
 		return nil, err
@@ -6730,7 +6971,8 @@ func helpManual(width int) string {
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
 		"Cloud hub mode: promag --cloud --addr :8080 --token <token> --data-dir .promag-cloud serves project-scoped APIs.",
 		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
-		"Cloud project tokens are printed once; rotate with promag --cloud-token --data-dir .promag-cloud Ops.",
+		"Cloud project tokens are printed once; create with promag --cloud-token Ops --token-label laptop --data-dir .promag-cloud.",
+		"List or revoke project tokens with --cloud-tokens Ops or --cloud-revoke-token <token-id>.",
 		"Cloud backups: promag --cloud-backup backups/cloud.json --data-dir .promag-cloud and --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
 		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
