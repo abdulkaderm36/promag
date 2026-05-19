@@ -713,6 +713,97 @@ func TestCloudServerImportsProjectBundle(t *testing.T) {
 	}
 }
 
+func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	project, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, projectToken, err := rotateProjectAccessToken(registryPath, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := createTask(project.DBPath, task{Title: "Backed up task", Priority: "medium", Status: "open"}, "manager-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	backupPath := filepath.Join(dir, "cloud-backup.json")
+	if err := backupCloudProjects(registryPath, backupPath); err != nil {
+		t.Fatal(err)
+	}
+	backupData, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(backupData, []byte(projectToken)) {
+		t.Fatal("cloud backup contained raw project token")
+	}
+
+	restoreRegistryPath := filepath.Join(dir, ".promag-cloud-restored", registryFile)
+	restoreProjectsBaseDir := filepath.Join(dir, ".promag-cloud-restored", projectsDir)
+	restoredCount, err := restoreCloudProjects(restoreRegistryPath, restoreProjectsBaseDir, backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoredCount != 1 {
+		t.Fatalf("restored count = %d, want 1", restoredCount)
+	}
+	restoredProjects, _, err := loadProjectRegistry(restoreRegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredProjects) != 1 {
+		t.Fatalf("restored projects = %#v", restoredProjects)
+	}
+	restored := restoredProjects[0]
+	if restored.ID != project.ID {
+		t.Fatalf("restored project ID = %q, want %q", restored.ID, project.ID)
+	}
+	if restored.AccessTokenHash != project.AccessTokenHash {
+		t.Fatalf("restored token hash = %q, want %q", restored.AccessTokenHash, project.AccessTokenHash)
+	}
+	state, err := loadState(restored.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Tasks) != 1 || state.Tasks[0].Title != "Backed up task" {
+		t.Fatalf("restored state = %#v", state)
+	}
+
+	handler := newCloudServer(restoreRegistryPath, restoreProjectsBaseDir, "admin-secret")
+	req := httptest.NewRequest(http.MethodGet, "/projects/"+restored.ID+"/state", nil)
+	req.Header.Set("Authorization", "Bearer "+projectToken)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("restored project token status = %d body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestCloudRestoreRequiresEmptyRegistry(t *testing.T) {
+	dir := t.TempDir()
+	sourceRegistryPath := filepath.Join(dir, "source", registryFile)
+	sourceProjectsBaseDir := filepath.Join(dir, "source", projectsDir)
+	if _, err := createCloudProject(sourceRegistryPath, sourceProjectsBaseDir, nil, "Source"); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(dir, "cloud-backup.json")
+	if err := backupCloudProjects(sourceRegistryPath, backupPath); err != nil {
+		t.Fatal(err)
+	}
+
+	targetRegistryPath := filepath.Join(dir, "target", registryFile)
+	targetProjectsBaseDir := filepath.Join(dir, "target", projectsDir)
+	if _, err := createCloudProject(targetRegistryPath, targetProjectsBaseDir, nil, "Existing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreCloudProjects(targetRegistryPath, targetProjectsBaseDir, backupPath); err == nil {
+		t.Fatal("expected restore into non-empty registry to fail")
+	}
+}
+
 func TestProjectRegistryAddsAccessTokenHashColumn(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)

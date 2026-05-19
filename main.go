@@ -35,6 +35,7 @@ import (
 const (
 	appTitle           = "ProMag"
 	exportVersion      = 1
+	cloudBackupVersion = 1
 	storageSchemaKey   = "schema_version"
 	storageSchemaVer   = 2
 	localActorID       = "local"
@@ -196,6 +197,30 @@ type projectExportBundle struct {
 	State         appState              `json:"state"`
 	Collaborators []collaborator        `json:"collaborators,omitempty"`
 	ActivityLog   []activityEvent       `json:"activity_log,omitempty"`
+}
+
+type cloudBackupBundle struct {
+	Version    int                  `json:"version"`
+	ExportedAt time.Time            `json:"exported_at"`
+	Projects   []cloudProjectBackup `json:"projects"`
+}
+
+type cloudProjectBackup struct {
+	Project       cloudProjectBackupRecord `json:"project"`
+	Config        appConfig                `json:"config"`
+	State         appState                 `json:"state"`
+	Collaborators []collaborator           `json:"collaborators,omitempty"`
+	ActivityLog   []activityEvent          `json:"activity_log,omitempty"`
+}
+
+type cloudProjectBackupRecord struct {
+	ID              string      `json:"id"`
+	Name            string      `json:"name"`
+	Type            projectType `json:"type"`
+	RemoteURL       string      `json:"remote_url"`
+	AccessTokenHash string      `json:"access_token_hash,omitempty"`
+	CreatedAt       time.Time   `json:"created_at"`
+	LastOpenedAt    time.Time   `json:"last_opened_at"`
 }
 
 type exportedProjectRecord struct {
@@ -449,7 +474,9 @@ func main() {
 	cloudCreateFlag := flag.Bool("cloud-create", false, "create a cloud project: --cloud-create <project-name>")
 	cloudImportFlag := flag.Bool("cloud-import", false, "import JSON into the cloud data directory: --cloud-import <project-name> <input-path.json>")
 	cloudTokenFlag := flag.String("cloud-token", "", "rotate and print a cloud project access token: --cloud-token <project-id-or-name>")
-	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for --cloud, --cloud-create, --cloud-import, and --cloud-token")
+	cloudBackupFlag := flag.String("cloud-backup", "", "back up all cloud projects to JSON: --cloud-backup <output-path.json>")
+	cloudRestoreFlag := flag.String("cloud-restore", "", "restore all cloud projects from JSON into an empty cloud data directory: --cloud-restore <input-path.json>")
+	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for cloud commands")
 	serveAddrFlag := flag.String("addr", ":8080", "address for --serve")
 	serveTokenFlag := flag.String("token", "", "bearer token for --serve or --cloud; can also use PROMAG_SERVER_TOKEN")
 	flag.Parse()
@@ -461,13 +488,20 @@ func main() {
 	mouseDebugOverlay = *debugHitboxesFlag || strings.TrimSpace(os.Getenv("PROMAG_DEBUG_HITBOXES")) == "1"
 
 	cloudActionCount := 0
-	for _, active := range []bool{*cloudFlag, *cloudCreateFlag, *cloudImportFlag, strings.TrimSpace(*cloudTokenFlag) != ""} {
+	for _, active := range []bool{
+		*cloudFlag,
+		*cloudCreateFlag,
+		*cloudImportFlag,
+		strings.TrimSpace(*cloudTokenFlag) != "",
+		strings.TrimSpace(*cloudBackupFlag) != "",
+		strings.TrimSpace(*cloudRestoreFlag) != "",
+	} {
 		if active {
 			cloudActionCount++
 		}
 	}
 	if cloudActionCount > 1 {
-		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, and --cloud-token cannot be used together")
+		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, --cloud-token, --cloud-backup, and --cloud-restore cannot be used together")
 		os.Exit(1)
 	}
 	if cloudActionCount > 0 {
@@ -537,6 +571,23 @@ func main() {
 			}
 			fmt.Fprintf(os.Stdout, "Rotated cloud project token for %q (%s)\n", project.Name, project.ID)
 			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			return
+		}
+		if strings.TrimSpace(*cloudBackupFlag) != "" {
+			if err := backupCloudProjects(cloudRegistryPath, *cloudBackupFlag); err != nil {
+				fmt.Fprintf(os.Stderr, "backup cloud projects: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Backed up %d cloud project(s) to %s\n", len(projects), *cloudBackupFlag)
+			return
+		}
+		if strings.TrimSpace(*cloudRestoreFlag) != "" {
+			restored, err := restoreCloudProjects(cloudRegistryPath, cloudProjectsBaseDir, *cloudRestoreFlag)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "restore cloud projects: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stdout, "Restored %d cloud project(s) from %s\n", restored, *cloudRestoreFlag)
 			return
 		}
 		token := strings.TrimSpace(*serveTokenFlag)
@@ -5953,6 +6004,18 @@ func exportProjectRecord(project projectRecord) exportedProjectRecord {
 	}
 }
 
+func exportCloudProjectRecord(project projectRecord) cloudProjectBackupRecord {
+	return cloudProjectBackupRecord{
+		ID:              project.ID,
+		Name:            project.Name,
+		Type:            project.Type,
+		RemoteURL:       project.RemoteURL,
+		AccessTokenHash: project.AccessTokenHash,
+		CreatedAt:       project.CreatedAt,
+		LastOpenedAt:    project.LastOpenedAt,
+	}
+}
+
 func importProjectBundle(registryPath, projectsBaseDir string, projects []projectRecord, inputPath, importName string) (projectRecord, error) {
 	bundle, err := readProjectExport(inputPath)
 	if err != nil {
@@ -5988,6 +6051,122 @@ func createProjectFromBundle(registryPath, projectsBaseDir, name string, bundle 
 		return projectRecord{}, fmt.Errorf("save imported collaboration data: %w", err)
 	}
 	return project, nil
+}
+
+func backupCloudProjects(registryPath, outputPath string) error {
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		return err
+	}
+	backup := cloudBackupBundle{
+		Version:    cloudBackupVersion,
+		ExportedAt: time.Now(),
+		Projects:   make([]cloudProjectBackup, 0, len(projects)),
+	}
+	for _, project := range projects {
+		bundle, err := buildProjectExportBundle(project)
+		if err != nil {
+			return fmt.Errorf("build backup for %q: %w", project.Name, err)
+		}
+		backup.Projects = append(backup.Projects, cloudProjectBackup{
+			Project:       exportCloudProjectRecord(project),
+			Config:        bundle.Config,
+			State:         bundle.State,
+			Collaborators: bundle.Collaborators,
+			ActivityLog:   bundle.ActivityLog,
+		})
+	}
+	return writeCloudBackup(outputPath, backup)
+}
+
+func restoreCloudProjects(registryPath, projectsBaseDir, inputPath string) (int, error) {
+	backup, err := readCloudBackup(inputPath)
+	if err != nil {
+		return 0, err
+	}
+	if backup.Version != cloudBackupVersion {
+		return 0, fmt.Errorf("unsupported cloud backup version %d", backup.Version)
+	}
+	existing, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		return 0, err
+	}
+	if len(existing) > 0 {
+		return 0, errors.New("cloud restore requires an empty cloud project registry")
+	}
+	seen := map[string]bool{}
+	for _, item := range backup.Projects {
+		project, err := projectRecordFromCloudBackup(projectsBaseDir, item.Project)
+		if err != nil {
+			return 0, err
+		}
+		if seen[project.ID] {
+			return 0, fmt.Errorf("duplicate project ID %q in backup", project.ID)
+		}
+		seen[project.ID] = true
+		if err := restoreCloudProject(registryPath, project, item); err != nil {
+			return 0, fmt.Errorf("restore project %q: %w", project.Name, err)
+		}
+	}
+	return len(backup.Projects), nil
+}
+
+func projectRecordFromCloudBackup(projectsBaseDir string, record cloudProjectBackupRecord) (projectRecord, error) {
+	id := strings.TrimSpace(record.ID)
+	if id == "" {
+		return projectRecord{}, errors.New("cloud backup project ID is required")
+	}
+	name := strings.TrimSpace(record.Name)
+	if name == "" {
+		return projectRecord{}, fmt.Errorf("cloud backup project %q name is required", id)
+	}
+	kind := normalizeProjectType(string(record.Type))
+	if kind == projectTypeRemote {
+		kind = projectTypeLocal
+	}
+	createdAt := record.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	lastOpenedAt := record.LastOpenedAt
+	if lastOpenedAt.IsZero() {
+		lastOpenedAt = createdAt
+	}
+	return projectRecord{
+		ID:              id,
+		Name:            name,
+		Type:            kind,
+		RemoteURL:       record.RemoteURL,
+		AccessTokenHash: record.AccessTokenHash,
+		DBPath:          filepath.Join(projectsBaseDir, id+".sqlite3"),
+		CreatedAt:       createdAt,
+		LastOpenedAt:    lastOpenedAt,
+	}, nil
+}
+
+func restoreCloudProject(registryPath string, project projectRecord, backup cloudProjectBackup) error {
+	if err := os.MkdirAll(filepath.Dir(project.DBPath), 0o755); err != nil {
+		return err
+	}
+	if fileExists(project.DBPath) {
+		return fmt.Errorf("project database already exists at %s", project.DBPath)
+	}
+	if err := insertProjectRecord(registryPath, project); err != nil {
+		return err
+	}
+	if err := saveState(project.DBPath, backup.State); err != nil {
+		return fmt.Errorf("save restored state: %w", err)
+	}
+	cfg := backup.Config
+	cfg.LeftWheelMode = cfg.leftWheelMode()
+	cfg.TaskSortMode = string(cfg.taskSortMode())
+	if err := saveConfig(project.DBPath, cfg); err != nil {
+		return fmt.Errorf("save restored config: %w", err)
+	}
+	if err := replaceCollaborationData(project.DBPath, backup.Collaborators, backup.ActivityLog); err != nil {
+		return fmt.Errorf("save restored collaboration data: %w", err)
+	}
+	return nil
 }
 
 func createCloudProject(registryPath, projectsBaseDir string, projects []projectRecord, name string) (projectRecord, error) {
@@ -6088,6 +6267,23 @@ func writeProjectExport(path string, bundle projectExportBundle) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func writeCloudBackup(path string, backup cloudBackupBundle) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("cloud backup path is required")
+	}
+	data, err := json.MarshalIndent(backup, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
 func readProjectExport(path string) (projectExportBundle, error) {
 	if strings.TrimSpace(path) == "" {
 		return projectExportBundle{}, errors.New("import path is required")
@@ -6101,6 +6297,21 @@ func readProjectExport(path string) (projectExportBundle, error) {
 		return projectExportBundle{}, err
 	}
 	return bundle, nil
+}
+
+func readCloudBackup(path string) (cloudBackupBundle, error) {
+	if strings.TrimSpace(path) == "" {
+		return cloudBackupBundle{}, errors.New("cloud restore path is required")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cloudBackupBundle{}, err
+	}
+	var backup cloudBackupBundle
+	if err := json.Unmarshal(data, &backup); err != nil {
+		return cloudBackupBundle{}, err
+	}
+	return backup, nil
 }
 
 func uniqueImportedProjectName(projects []projectRecord, base string) string {
@@ -6152,17 +6363,7 @@ func createProjectRecord(registryPath, projectsBaseDir, name string, kind projec
 	}
 	defer db.Close()
 
-	_, err = db.Exec(
-		`INSERT INTO projects (id, name, type, remote_url, db_path, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		project.ID,
-		project.Name,
-		string(project.Type),
-		project.RemoteURL,
-		project.DBPath,
-		project.CreatedAt.Format(time.RFC3339Nano),
-		project.LastOpenedAt.Format(time.RFC3339Nano),
-	)
-	if err != nil {
+	if err := insertProjectRecordWithDB(db, project); err != nil {
 		return projectRecord{}, err
 	}
 	if err := saveLastProjectID(db, project.ID); err != nil {
@@ -6172,6 +6373,33 @@ func createProjectRecord(registryPath, projectsBaseDir, name string, kind projec
 		return projectRecord{}, err
 	}
 	return project, nil
+}
+
+func insertProjectRecord(registryPath string, project projectRecord) error {
+	db, err := openProjectRegistry(registryPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := insertProjectRecordWithDB(db, project); err != nil {
+		return err
+	}
+	return saveLastProjectID(db, project.ID)
+}
+
+func insertProjectRecordWithDB(db *sql.DB, project projectRecord) error {
+	_, err := db.Exec(
+		`INSERT INTO projects (id, name, type, remote_url, access_token_hash, db_path, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		project.ID,
+		project.Name,
+		string(project.Type),
+		project.RemoteURL,
+		project.AccessTokenHash,
+		project.DBPath,
+		project.CreatedAt.Format(time.RFC3339Nano),
+		project.LastOpenedAt.Format(time.RFC3339Nano),
+	)
+	return err
 }
 
 func updateProjectRecord(registryPath, projectID, name string, kind projectType, remoteURL string) (projectRecord, error) {
@@ -6503,6 +6731,7 @@ func helpManual(width int) string {
 		"Cloud hub mode: promag --cloud --addr :8080 --token <token> --data-dir .promag-cloud serves project-scoped APIs.",
 		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
 		"Cloud project tokens are printed once; rotate with promag --cloud-token --data-dir .promag-cloud Ops.",
+		"Cloud backups: promag --cloud-backup backups/cloud.json --data-dir .promag-cloud and --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
 		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
 		"",

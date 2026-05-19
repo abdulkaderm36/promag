@@ -73,8 +73,12 @@ promag
   - Imports a project JSON file into the cloud data directory
 - `--cloud-token <project-id-or-name>`
   - Rotates and prints a cloud project access token
+- `--cloud-backup <path.json>`
+  - Backs up all cloud projects to a JSON file, including project token hashes
+- `--cloud-restore <path.json>`
+  - Restores all cloud projects from a JSON backup into an empty cloud data directory
 - `--data-dir <path>`
-  - Data directory for `--cloud`, `--cloud-create`, `--cloud-import`, and `--cloud-token`; defaults to `.promag-cloud`
+  - Data directory for cloud commands; defaults to `.promag-cloud`
 - `--addr <host:port>`
   - Address for `--serve` or `--cloud`; defaults to `:8080`
 - `--token <token>`
@@ -94,6 +98,8 @@ go run . --serve Ops --addr :8080 --token "$PROMAG_SERVER_TOKEN"
 go run . --cloud-create --data-dir .promag-cloud Ops
 go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
 go run . --cloud-token --data-dir .promag-cloud Ops
+go run . --cloud-backup backups/cloud.json --data-dir .promag-cloud
+go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud
 go run . --cloud --addr :8080 --token "$PROMAG_SERVER_TOKEN" --data-dir .promag-cloud
 ```
 
@@ -266,9 +272,13 @@ Create or import projects into the cloud data directory:
 go run . --cloud-create --data-dir .promag-cloud Ops
 go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
 go run . --cloud-token --data-dir .promag-cloud Ops
+go run . --cloud-backup backups/cloud.json --data-dir .promag-cloud
+go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored
 ```
 
 `--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token. Use that token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, and importing projects.
+
+`--cloud-backup` writes one JSON file containing every cloud project's metadata, config, state, collaborators, activity, and project token hashes. Raw project tokens are not stored. `--cloud-restore` preserves project IDs and token hashes, so existing remote URLs and project tokens continue to work, but it only restores into an empty cloud registry.
 
 Cloud API routes are project-scoped:
 
@@ -303,6 +313,7 @@ Create or import cloud projects by running one-off commands against the same vol
 docker compose run --rm promag-cloud --cloud-create --data-dir /data Ops
 docker compose run --rm -v "$PWD/backups:/imports:ro" promag-cloud --cloud-import --data-dir /data Ops /imports/ops.json
 docker compose run --rm promag-cloud --cloud-token --data-dir /data Ops
+docker compose run --rm -v "$PWD/backups:/backups" promag-cloud --cloud-backup /backups/cloud.json --data-dir /data
 ```
 
 For a remote client, use:
