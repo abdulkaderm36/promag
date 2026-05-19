@@ -2347,7 +2347,7 @@ func (m *model) submitMemberForm() error {
 			Email: email,
 		}
 		if _, err := m.updateMemberRecord(mem, m.editingMemberVer); err != nil {
-			return m.handleStorageError(err, "Member changed elsewhere. Reloaded latest version.")
+			return m.handleMemberStorageError(err, m.editingMemberID)
 		}
 		return m.reloadState()
 	}
@@ -2408,7 +2408,7 @@ func (m *model) submitTaskForm() error {
 		updated.Comments = comments
 		updated.DueDate = dueDate
 		if _, err := m.updateTaskRecord(updated, m.editingTaskVersion); err != nil {
-			return m.handleStorageError(err, "Task changed elsewhere. Reloaded latest version.")
+			return m.handleTaskStorageError(err, m.editingTaskID)
 		}
 		m.activeView = viewTasks
 		return m.reloadState()
@@ -2663,11 +2663,12 @@ func (m model) toggleSelectedTask() model {
 	}
 	if err := m.setTaskStatusRecord(selected.ID, nextStatus, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
+			taskID := selected.ID
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
 				return m
 			}
-			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			m.setStatus(m.taskConflictMessage(taskID))
 			return m
 		}
 		m.setStatus("save failed: " + err.Error())
@@ -2697,11 +2698,12 @@ func (m model) archiveSelectedTask() model {
 	}
 	if err := m.setTaskArchivedRecord(selected.ID, true, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
+			taskID := selected.ID
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
 				return m
 			}
-			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			m.setStatus(m.taskConflictMessage(taskID))
 			return m
 		}
 		m.setStatus("save failed: " + err.Error())
@@ -2728,11 +2730,12 @@ func (m model) restoreSelectedTask() model {
 	}
 	if err := m.setTaskArchivedRecord(selected.ID, false, selected.Version); err != nil {
 		if errors.Is(err, errVersionConflict) {
+			taskID := selected.ID
 			if reloadErr := m.reloadState(); reloadErr != nil {
 				m.setStatus("reload failed: " + reloadErr.Error())
 				return m
 			}
-			m.setStatus("Task changed elsewhere. Reloaded latest version.")
+			m.setStatus(m.taskConflictMessage(taskID))
 			return m
 		}
 		m.setStatus("save failed: " + err.Error())
@@ -2757,11 +2760,12 @@ func (m model) deleteSelected() model {
 		}
 		if err := m.deleteTaskRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
+				taskID := selected.ID
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
 					return m
 				}
-				m.setStatus("Task changed elsewhere. Reloaded latest version.")
+				m.setStatus(m.taskConflictMessage(taskID))
 				return m
 			}
 			m.setStatus("save failed: " + err.Error())
@@ -2780,11 +2784,12 @@ func (m model) deleteSelected() model {
 		}
 		if err := m.deleteTaskRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
+				taskID := selected.ID
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
 					return m
 				}
-				m.setStatus("Task changed elsewhere. Reloaded latest version.")
+				m.setStatus(m.taskConflictMessage(taskID))
 				return m
 			}
 			m.setStatus("save failed: " + err.Error())
@@ -2808,11 +2813,12 @@ func (m model) deleteSelected() model {
 		}
 		if err := m.deleteMemberRecord(selected.ID, selected.Version); err != nil {
 			if errors.Is(err, errVersionConflict) {
+				memberID := selected.ID
 				if reloadErr := m.reloadState(); reloadErr != nil {
 					m.setStatus("reload failed: " + reloadErr.Error())
 					return m
 				}
-				m.setStatus("Member changed elsewhere. Reloaded latest version.")
+				m.setStatus(m.memberConflictMessage(memberID))
 				return m
 			}
 			m.setStatus("save failed: " + err.Error())
@@ -4366,6 +4372,16 @@ func (m model) taskByID(id string) *task {
 	return nil
 }
 
+func (m model) memberByID(id string) *member {
+	for _, mem := range m.state.Members {
+		if mem.ID == id {
+			copy := mem
+			return &copy
+		}
+	}
+	return nil
+}
+
 func (m model) remoteClient() (remoteProjectClient, error) {
 	return newRemoteProjectClient(m.currentProject)
 }
@@ -4514,14 +4530,67 @@ func (m *model) clampViewCursor(view viewMode) {
 	m.activeView = current
 }
 
-func (m *model) handleStorageError(err error, conflictMessage string) error {
+func (m *model) handleTaskStorageError(err error, taskID string) error {
 	if !errors.Is(err, errVersionConflict) {
 		return err
 	}
 	if reloadErr := m.reloadState(); reloadErr != nil {
-		return fmt.Errorf("%s Reload failed: %w", conflictMessage, reloadErr)
+		return fmt.Errorf("%s Reload failed: %w", taskConflictFallback, reloadErr)
 	}
-	return errors.New(conflictMessage)
+	return errors.New(m.taskConflictMessage(taskID))
+}
+
+func (m *model) handleMemberStorageError(err error, memberID string) error {
+	if !errors.Is(err, errVersionConflict) {
+		return err
+	}
+	if reloadErr := m.reloadState(); reloadErr != nil {
+		return fmt.Errorf("%s Reload failed: %w", memberConflictFallback, reloadErr)
+	}
+	return errors.New(m.memberConflictMessage(memberID))
+}
+
+const (
+	taskConflictFallback   = "Task changed elsewhere. Reloaded latest version."
+	memberConflictFallback = "Member changed elsewhere. Reloaded latest version."
+)
+
+func (m model) taskConflictMessage(taskID string) string {
+	t := m.taskByID(taskID)
+	if t == nil {
+		return "Task changed or was removed elsewhere. Reloaded latest version."
+	}
+	subject := "Task"
+	if title := strings.TrimSpace(t.Title); title != "" {
+		subject = fmt.Sprintf("Task %q", title)
+	}
+	return m.recordConflictMessage(subject, t.UpdatedBy, t.UpdatedAt, taskConflictFallback)
+}
+
+func (m model) memberConflictMessage(memberID string) string {
+	mem := m.memberByID(memberID)
+	if mem == nil {
+		return "Member changed or was removed elsewhere. Reloaded latest version."
+	}
+	subject := "Member"
+	if name := strings.TrimSpace(mem.Name); name != "" {
+		subject = fmt.Sprintf("Member %q", name)
+	}
+	return m.recordConflictMessage(subject, mem.UpdatedBy, mem.UpdatedAt, memberConflictFallback)
+}
+
+func (m model) recordConflictMessage(subject, updatedBy string, updatedAt time.Time, fallback string) string {
+	parts := []string{}
+	if strings.TrimSpace(updatedBy) != "" {
+		parts = append(parts, "by "+m.collaboratorDisplayName(updatedBy))
+	}
+	if !updatedAt.IsZero() {
+		parts = append(parts, relativeTime(time.Now(), updatedAt))
+	}
+	if len(parts) == 0 {
+		return fallback
+	}
+	return fmt.Sprintf("%s changed %s. Reloaded latest version.", subject, strings.Join(parts, " "))
 }
 
 func loadState(path string) (appState, error) {

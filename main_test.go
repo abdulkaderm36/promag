@@ -861,6 +861,41 @@ func TestRemoteStatusSummary(t *testing.T) {
 	}
 }
 
+func TestConflictMessagesIncludeLatestEditorContext(t *testing.T) {
+	now := time.Now()
+	m := model{
+		collaborators: []collaborator{{ID: "manager-1", Name: "Manager One"}},
+		state: appState{
+			Tasks:   []task{{ID: "tsk-1", Title: "Roadmap", UpdatedBy: "manager-1", UpdatedAt: now.Add(-2 * time.Minute)}},
+			Members: []member{{ID: "mem-1", Name: "Sara", UpdatedBy: "manager-1", UpdatedAt: now.Add(-3 * time.Minute)}},
+		},
+	}
+
+	taskMessage := m.taskConflictMessage("tsk-1")
+	for _, want := range []string{"Task \"Roadmap\"", "Manager One", "Reloaded latest version"} {
+		if !strings.Contains(taskMessage, want) {
+			t.Fatalf("task conflict message = %q, want to contain %q", taskMessage, want)
+		}
+	}
+
+	memberMessage := m.memberConflictMessage("mem-1")
+	for _, want := range []string{"Member \"Sara\"", "Manager One", "Reloaded latest version"} {
+		if !strings.Contains(memberMessage, want) {
+			t.Fatalf("member conflict message = %q, want to contain %q", memberMessage, want)
+		}
+	}
+}
+
+func TestConflictMessageFallsBackWithoutMetadata(t *testing.T) {
+	m := model{state: appState{Tasks: []task{{ID: "tsk-1", Title: "Roadmap"}}}}
+	if got := m.taskConflictMessage("tsk-1"); got != taskConflictFallback {
+		t.Fatalf("task conflict message = %q, want fallback", got)
+	}
+	if got := m.taskConflictMessage("missing"); !strings.Contains(got, "removed elsewhere") {
+		t.Fatalf("missing task conflict message = %q", got)
+	}
+}
+
 func TestActiveCollaboratorCountUsesLastSeenWindow(t *testing.T) {
 	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
 	m := model{collaborators: []collaborator{
