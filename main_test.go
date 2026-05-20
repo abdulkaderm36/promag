@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1360,6 +1361,76 @@ func TestCloudProjectTokenAdminHTTPDoesNotRevokeOtherProjectsToken(t *testing.T)
 	}
 }
 
+func TestCloudTokenCLICommands(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "promag-test")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build promag test binary: %v\n%s", err, output)
+	}
+
+	dataDir := filepath.Join(dir, "cloud-data")
+	createOutput := runPromagCLI(t, bin, "--cloud-create", "--data-dir", dataDir, "Ops")
+	if !strings.Contains(createOutput, "Created cloud project \"Ops\"") {
+		t.Fatalf("cloud create output = %q", createOutput)
+	}
+	initialTokenID := extractOutputValue(t, createOutput, "Project token ID: ")
+	initialToken := extractOutputValue(t, createOutput, "Project token: ")
+
+	tokenOutput := runPromagCLI(t, bin, "--cloud-token", "Ops", "--token-label", "manager laptop", "--data-dir", dataDir)
+	if !strings.Contains(tokenOutput, "Created cloud project token for \"Ops\"") {
+		t.Fatalf("cloud token output = %q", tokenOutput)
+	}
+	labeledTokenID := extractOutputValue(t, tokenOutput, "Project token ID: ")
+	labeledToken := extractOutputValue(t, tokenOutput, "Project token: ")
+
+	listOutput := runPromagCLI(t, bin, "--cloud-tokens", "Ops", "--data-dir", dataDir)
+	for _, want := range []string{
+		initialTokenID + "\tdefault\tactive",
+		labeledTokenID + "\tmanager laptop\tactive",
+	} {
+		if !strings.Contains(listOutput, want) {
+			t.Fatalf("token list output = %q, want %q", listOutput, want)
+		}
+	}
+
+	revokeOutput := runPromagCLI(t, bin, "--cloud-revoke-token", labeledTokenID, "--data-dir", dataDir)
+	if !strings.Contains(revokeOutput, "Revoked cloud project token "+labeledTokenID+" (manager laptop)") {
+		t.Fatalf("revoke output = %q", revokeOutput)
+	}
+	listOutput = runPromagCLI(t, bin, "--cloud-tokens", "Ops", "--data-dir", dataDir)
+	if !strings.Contains(listOutput, initialTokenID+"\tdefault\tactive") {
+		t.Fatalf("token list after revoke = %q, want initial token active", listOutput)
+	}
+	if !strings.Contains(listOutput, labeledTokenID+"\tmanager laptop\trevoked") {
+		t.Fatalf("token list after revoke = %q, want labeled token revoked", listOutput)
+	}
+
+	registryPath := filepath.Join(dataDir, registryFile)
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 || projects[0].Name != "Ops" {
+		t.Fatalf("cloud projects = %#v, want Ops", projects)
+	}
+	initialActive, err := projectAccessTokenActive(registryPath, projects[0].ID, hashToken(initialToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initialActive {
+		t.Fatal("initial project token should still be active")
+	}
+	labeledActive, err := projectAccessTokenActive(registryPath, projects[0].ID, hashToken(labeledToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labeledActive {
+		t.Fatal("revoked project token should not be active")
+	}
+}
+
 func TestHTTPAccessLogging(t *testing.T) {
 	var log bytes.Buffer
 	previous := accessLogWriter
@@ -1750,6 +1821,32 @@ func serveJSONRequestWithAuth(t *testing.T, handler http.Handler, method, path s
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+func runPromagCLI(t *testing.T, bin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("promag %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
+}
+
+func extractOutputValue(t *testing.T, output, prefix string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if value == "" {
+				t.Fatalf("empty output value for %q in %q", prefix, output)
+			}
+			return value
+		}
+	}
+	t.Fatalf("missing output prefix %q in %q", prefix, output)
+	return ""
 }
 
 func mustJSON(t *testing.T, value any) []byte {
