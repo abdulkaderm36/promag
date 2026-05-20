@@ -721,11 +721,11 @@ func TestProjectAccessTokensCanBeMultipleAndRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, firstRecord, firstToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One")
+	_, firstRecord, firstToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One", "admin-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secondRecord, secondToken, err := createProjectAccessToken(registryPath, project.ID, "Manager Two")
+	_, secondRecord, secondToken, err := createProjectAccessToken(registryPath, project.ID, "Manager Two", "admin-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +746,7 @@ func TestProjectAccessTokensCanBeMultipleAndRevoked(t *testing.T) {
 		t.Fatalf("first token status = %d body = %s", resp.Code, resp.Body.String())
 	}
 
-	revoked, err := revokeProjectAccessToken(registryPath, firstRecord.ID)
+	revoked, err := revokeProjectAccessToken(registryPath, firstRecord.ID, "admin-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,6 +772,40 @@ func TestProjectAccessTokensCanBeMultipleAndRevoked(t *testing.T) {
 	if secondRecord.Label != "Manager Two" {
 		t.Fatalf("second token label = %q, want Manager Two", secondRecord.Label)
 	}
+	events, err := loadActivityLog(project.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasActivityAction(events, "token.created") || !hasActivityAction(events, "token.revoked") {
+		t.Fatalf("token activity events = %#v, want token.created and token.revoked", events)
+	}
+}
+
+func TestHTTPAccessLogging(t *testing.T) {
+	var log bytes.Buffer
+	previous := accessLogWriter
+	accessLogWriter = &log
+	defer func() {
+		accessLogWriter = previous
+	}()
+
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	handler := newCloudServer(registryPath, projectsBaseDir, "secret")
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("health status = %d", resp.Code)
+	}
+	got := log.String()
+	for _, want := range []string{"access", "scope=cloud", "method=GET", "path=/health", "status=200"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("access log = %q, want %q", got, want)
+		}
+	}
 }
 
 func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
@@ -789,7 +823,7 @@ func TestCloudBackupRestorePreservesProjectsAndTokens(t *testing.T) {
 	if _, err := createTask(project.DBPath, task{Title: "Backed up task", Priority: "medium", Status: "open"}, "manager-1"); err != nil {
 		t.Fatal(err)
 	}
-	_, namedToken, rawNamedToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One")
+	_, namedToken, rawNamedToken, err := createProjectAccessToken(registryPath, project.ID, "Manager One", "admin-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1146,6 +1180,15 @@ func mustJSON(t *testing.T, value any) []byte {
 func hasCollaborator(collaborators []collaborator, id string) bool {
 	for _, collab := range collaborators {
 		if collab.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func hasActivityAction(events []activityEvent, action string) bool {
+	for _, event := range events {
+		if event.Action == action {
 			return true
 		}
 	}

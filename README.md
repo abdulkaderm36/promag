@@ -290,6 +290,8 @@ go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored
 
 `--cloud-backup` writes one JSON file containing every cloud project's metadata, config, state, collaborators, activity, and project token hashes. Raw project tokens are not stored. `--cloud-restore` preserves project IDs and token hashes, including active and revoked token records, so existing remote URLs and project tokens continue to work, but it only restores into an empty cloud registry.
 
+The HTTP servers write one access log line per external request to stdout. Project token creation and revocation are also written to the project's activity log.
+
 Cloud API routes are project-scoped:
 
 - `GET /projects`: list cloud projects; admin token required

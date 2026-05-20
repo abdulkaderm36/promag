@@ -60,6 +60,7 @@ var mouseDebugLogPath string
 var mouseDebugOverlay bool
 var currentLayout layoutState
 var errVersionConflict = errors.New("record changed since it was loaded")
+var accessLogWriter io.Writer = os.Stdout
 
 type viewMode string
 
@@ -542,7 +543,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"))
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"), localActorID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
@@ -564,7 +565,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "import cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"))
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, fallback(*cloudTokenLabelFlag, "default"), localActorID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
@@ -581,7 +582,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "select cloud project: %v\n", err)
 				os.Exit(1)
 			}
-			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, *cloudTokenLabelFlag)
+			project, tokenRecord, projectToken, err := createProjectAccessToken(cloudRegistryPath, project.ID, *cloudTokenLabelFlag, localActorID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
@@ -613,7 +614,7 @@ func main() {
 			return
 		}
 		if strings.TrimSpace(*cloudRevokeTokenFlag) != "" {
-			tokenRecord, err := revokeProjectAccessToken(cloudRegistryPath, *cloudRevokeTokenFlag)
+			tokenRecord, err := revokeProjectAccessToken(cloudRegistryPath, *cloudRevokeTokenFlag, localActorID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "revoke cloud project token: %v\n", err)
 				os.Exit(1)
@@ -3723,6 +3724,11 @@ func newCloudServer(registryPath, projectsBaseDir, token string) http.Handler {
 }
 
 func (s cloudServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	recorder := newStatusRecorder(w)
+	start := time.Now()
+	defer logHTTPAccess("cloud", recorder, r, start, "")
+	w = recorder
+
 	if r.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -3778,7 +3784,7 @@ func (s cloudServer) handleProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api")
+		project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api", s.actorID(r))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -3820,7 +3826,7 @@ func (s cloudServer) handleProjectImport(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api")
+	project, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, "api", s.actorID(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -3853,7 +3859,12 @@ func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request,
 	next.RequestURI = ""
 	next.Header = r.Header.Clone()
 	next.Header.Set("X-ProMag-Token", s.token)
+	next.Header.Set("X-ProMag-Internal-Forward", "1")
 	newProjectServer(project, s.token).ServeHTTP(w, next)
+}
+
+func (s cloudServer) actorID(r *http.Request) string {
+	return normalizeActorID(r.Header.Get("X-ProMag-Actor"))
 }
 
 func (s cloudServer) authorizedForProject(r *http.Request, project projectRecord) bool {
@@ -3919,6 +3930,14 @@ func newProjectServer(project projectRecord, token string) http.Handler {
 }
 
 func (s projectServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	recorder := newStatusRecorder(w)
+	start := time.Now()
+	internalForward := strings.TrimSpace(r.Header.Get("X-ProMag-Internal-Forward")) == "1"
+	if !internalForward {
+		defer logHTTPAccess("project", recorder, r, start, "project="+s.project.ID)
+	}
+	w = recorder
+
 	if r.URL.Path == "/health" {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -4283,6 +4302,48 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(data []byte) (int, error) {
+	written, err := r.ResponseWriter.Write(data)
+	r.bytes += written
+	return written, err
+}
+
+func logHTTPAccess(scope string, recorder *statusRecorder, r *http.Request, startedAt time.Time, extra string) {
+	if accessLogWriter == nil {
+		return
+	}
+	actor := normalizeActorID(r.Header.Get("X-ProMag-Actor"))
+	parts := []string{
+		"access",
+		"scope=" + scope,
+		"method=" + r.Method,
+		"path=" + r.URL.Path,
+		fmt.Sprintf("status=%d", recorder.status),
+		fmt.Sprintf("bytes=%d", recorder.bytes),
+		"duration=" + time.Since(startedAt).String(),
+		"actor=" + actor,
+	}
+	if extra != "" {
+		parts = append(parts, extra)
+	}
+	fmt.Fprintln(accessLogWriter, strings.Join(parts, " "))
 }
 
 func newRemoteProjectClient(project projectRecord) (remoteProjectClient, error) {
@@ -5378,6 +5439,29 @@ func appendActivityTx(tx *sql.Tx, actorID, action, entityType, entityID, summary
 	return err
 }
 
+func appendProjectActivity(path, actorID, action, entityType, entityID, summary string) error {
+	db, err := openStorage(path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	actorID = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, actorID); err != nil {
+		return err
+	}
+	if err := appendActivityTx(tx, actorID, action, entityType, entityID, summary); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func ensureCollaboratorTx(tx *sql.Tx, actorID string) error {
 	actorID = normalizeActorID(actorID)
 	now := time.Now()
@@ -6268,7 +6352,7 @@ func rotateProjectAccessToken(registryPath, projectID string) (projectRecord, st
 	return projectRecord{}, "", errors.New("project not found after token rotation")
 }
 
-func createProjectAccessToken(registryPath, projectID, label string) (projectRecord, projectAccessToken, string, error) {
+func createProjectAccessToken(registryPath, projectID, label, actorID string) (projectRecord, projectAccessToken, string, error) {
 	project, err := projectByIDFromRegistry(registryPath, projectID)
 	if err != nil {
 		return projectRecord{}, projectAccessToken{}, "", err
@@ -6289,6 +6373,9 @@ func createProjectAccessToken(registryPath, projectID, label string) (projectRec
 		record.Label = "default"
 	}
 	if err := insertProjectAccessToken(registryPath, record); err != nil {
+		return projectRecord{}, projectAccessToken{}, "", err
+	}
+	if err := appendProjectActivity(project.DBPath, actorID, "token.created", "access_token", record.ID, fmt.Sprintf("created project token %s", record.Label)); err != nil {
 		return projectRecord{}, projectAccessToken{}, "", err
 	}
 	return project, record, token, nil
@@ -6324,7 +6411,7 @@ func insertProjectAccessToken(registryPath string, token projectAccessToken) err
 	return err
 }
 
-func revokeProjectAccessToken(registryPath, tokenID string) (projectAccessToken, error) {
+func revokeProjectAccessToken(registryPath, tokenID, actorID string) (projectAccessToken, error) {
 	tokenID = strings.TrimSpace(tokenID)
 	if tokenID == "" {
 		return projectAccessToken{}, errors.New("token ID is required")
@@ -6346,7 +6433,18 @@ func revokeProjectAccessToken(registryPath, tokenID string) (projectAccessToken,
 	if affected == 0 {
 		return projectAccessToken{}, fmt.Errorf("active token %q was not found", tokenID)
 	}
-	return loadProjectAccessTokenByID(registryPath, tokenID)
+	token, err := loadProjectAccessTokenByID(registryPath, tokenID)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	project, err := projectByIDFromRegistry(registryPath, token.ProjectID)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	if err := appendProjectActivity(project.DBPath, actorID, "token.revoked", "access_token", token.ID, fmt.Sprintf("revoked project token %s", token.Label)); err != nil {
+		return projectAccessToken{}, err
+	}
+	return token, nil
 }
 
 func projectAccessTokenActive(registryPath, projectID, tokenHash string) (bool, error) {
@@ -6974,6 +7072,7 @@ func helpManual(width int) string {
 		"Cloud project tokens are printed once; create with promag --cloud-token Ops --token-label laptop --data-dir .promag-cloud.",
 		"List or revoke project tokens with --cloud-tokens Ops or --cloud-revoke-token <token-id>.",
 		"Cloud backups: promag --cloud-backup backups/cloud.json --data-dir .promag-cloud and --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored.",
+		"HTTP servers write access logs to stdout; token create/revoke events appear in project activity.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",
 		"Active remote projects refresh server state every few seconds and show active collaborators plus recent activity in the detail pane.",
 		"",
