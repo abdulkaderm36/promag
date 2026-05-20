@@ -1363,12 +1363,7 @@ func TestCloudProjectTokenAdminHTTPDoesNotRevokeOtherProjectsToken(t *testing.T)
 
 func TestCloudTokenCLICommands(t *testing.T) {
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "promag-test")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Dir = "."
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build promag test binary: %v\n%s", err, output)
-	}
+	bin := buildPromagTestBinary(t, dir)
 
 	dataDir := filepath.Join(dir, "cloud-data")
 	createOutput := runPromagCLI(t, bin, "--cloud-create", "--data-dir", dataDir, "Ops")
@@ -1428,6 +1423,77 @@ func TestCloudTokenCLICommands(t *testing.T) {
 	}
 	if labeledActive {
 		t.Fatal("revoked project token should not be active")
+	}
+}
+
+func TestCloudBackupRestoreCLICommands(t *testing.T) {
+	dir := t.TempDir()
+	bin := buildPromagTestBinary(t, dir)
+	dataDir := filepath.Join(dir, "cloud-data")
+
+	createOutput := runPromagCLI(t, bin, "--cloud-create", "--data-dir", dataDir, "Ops")
+	if !strings.Contains(createOutput, "Created cloud project \"Ops\"") {
+		t.Fatalf("cloud create output = %q", createOutput)
+	}
+	projectToken := extractOutputValue(t, createOutput, "Project token: ")
+
+	registryPath := filepath.Join(dataDir, registryFile)
+	projects, _, err := loadProjectRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("cloud projects = %#v, want one project", projects)
+	}
+	project := projects[0]
+	if _, err := createTask(project.DBPath, task{Title: "CLI backed up task", Priority: "medium", Status: "open"}, "manager-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	backupPath := filepath.Join(dir, "cloud-backup.json")
+	backupOutput := runPromagCLI(t, bin, "--cloud-backup", backupPath, "--data-dir", dataDir)
+	if !strings.Contains(backupOutput, "Backed up 1 cloud project(s) to "+backupPath) {
+		t.Fatalf("cloud backup output = %q", backupOutput)
+	}
+	backupData, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(backupData, []byte(projectToken)) {
+		t.Fatal("cloud backup CLI wrote raw project token")
+	}
+
+	restoreDataDir := filepath.Join(dir, "cloud-data-restored")
+	restoreOutput := runPromagCLI(t, bin, "--cloud-restore", backupPath, "--data-dir", restoreDataDir)
+	if !strings.Contains(restoreOutput, "Restored 1 cloud project(s) from "+backupPath) {
+		t.Fatalf("cloud restore output = %q", restoreOutput)
+	}
+	restoredRegistryPath := filepath.Join(restoreDataDir, registryFile)
+	restoredProjects, _, err := loadProjectRegistry(restoredRegistryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredProjects) != 1 || restoredProjects[0].ID != project.ID {
+		t.Fatalf("restored projects = %#v, want project ID %s", restoredProjects, project.ID)
+	}
+	restoredState, err := loadState(restoredProjects[0].DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredState.Tasks) != 1 || restoredState.Tasks[0].Title != "CLI backed up task" {
+		t.Fatalf("restored state = %#v", restoredState)
+	}
+	active, err := projectAccessTokenActive(restoredRegistryPath, restoredProjects[0].ID, hashToken(projectToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !active {
+		t.Fatal("restored project token should remain active")
+	}
+
+	listOutput := runPromagCLI(t, bin, "--cloud-tokens", "Ops", "--data-dir", restoreDataDir)
+	if !strings.Contains(listOutput, "\tdefault\tactive") {
+		t.Fatalf("restored cloud tokens output = %q, want default active token", listOutput)
 	}
 }
 
@@ -1821,6 +1887,17 @@ func serveJSONRequestWithAuth(t *testing.T, handler http.Handler, method, path s
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+func buildPromagTestBinary(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "promag-test")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build promag test binary: %v\n%s", err, output)
+	}
+	return bin
 }
 
 func runPromagCLI(t *testing.T, bin string, args ...string) string {
