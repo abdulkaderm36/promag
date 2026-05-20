@@ -755,6 +755,74 @@ func TestCloudProjectTokensAreScopedAndForwardTaskConflicts(t *testing.T) {
 	}
 }
 
+func TestCloudProjectRoutesForwardMemberConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	project, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Members")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, project.ID, "Team", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newCloudServer(registryPath, projectsBaseDir, "admin-secret")
+
+	createResp := serveJSONRequestWithAuth(t, handler, http.MethodPost, "/projects/"+project.ID+"/members", mustJSON(t, memberWriteRequest{
+		Member: member{Name: "Asha Rao", Role: "Manager", Email: "asha@example.test"},
+	}), projectToken, "manager-one")
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	var created member
+	if err := json.Unmarshal(createResp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Version != 1 || created.UpdatedBy != "manager-one" {
+		t.Fatalf("created member metadata = version %d updated_by %q", created.Version, created.UpdatedBy)
+	}
+
+	updatedMember := created
+	updatedMember.Role = "Delivery Lead"
+	updateResp := serveJSONRequestWithAuth(t, handler, http.MethodPatch, "/projects/"+project.ID+"/members/"+created.ID, mustJSON(t, memberWriteRequest{
+		Member:          updatedMember,
+		ExpectedVersion: created.Version,
+	}), projectToken, "manager-two")
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("update member status = %d body = %s", updateResp.Code, updateResp.Body.String())
+	}
+	var updated member
+	if err := json.Unmarshal(updateResp.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 || updated.UpdatedBy != "manager-two" {
+		t.Fatalf("updated member metadata = version %d updated_by %q", updated.Version, updated.UpdatedBy)
+	}
+
+	staleMember := created
+	staleMember.Role = "Stale role"
+	staleResp := serveJSONRequestWithAuth(t, handler, http.MethodPatch, "/projects/"+project.ID+"/members/"+created.ID, mustJSON(t, memberWriteRequest{
+		Member:          staleMember,
+		ExpectedVersion: created.Version,
+	}), projectToken, "manager-three")
+	if staleResp.Code != http.StatusConflict {
+		t.Fatalf("stale member update status = %d body = %s, want conflict", staleResp.Code, staleResp.Body.String())
+	}
+
+	stateResp := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+project.ID+"/state", nil, projectToken, "manager-one")
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.State.Members) != 1 || state.State.Members[0].Role != "Delivery Lead" {
+		t.Fatalf("cloud scoped members = %#v", state.State.Members)
+	}
+}
+
 func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
@@ -833,6 +901,43 @@ func TestRemoteProjectClientMapsCloudProjectConflicts(t *testing.T) {
 	_, err = firstClient.updateTask(staleUpdate, created.Version)
 	if !errors.Is(err, errVersionConflict) {
 		t.Fatalf("stale remote update error = %v, want errVersionConflict", err)
+	}
+}
+
+func TestRemoteProjectClientMapsCloudMemberConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Member Conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, cloudProject.ID, "Shared", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
+	defer server.Close()
+
+	baseURL := server.URL + "/projects/" + cloudProject.ID
+	firstClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-one", client: server.Client()}
+	secondClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-two", client: server.Client()}
+
+	created, err := firstClient.createMember(member{Name: "Mina Chen", Role: "Manager", Email: "mina@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondUpdate := created
+	secondUpdate.Role = "Program Lead"
+	if _, err := secondClient.updateMember(secondUpdate, created.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	staleUpdate := created
+	staleUpdate.Role = "Stale member role"
+	_, err = firstClient.updateMember(staleUpdate, created.Version)
+	if !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale remote member update error = %v, want errVersionConflict", err)
 	}
 }
 
