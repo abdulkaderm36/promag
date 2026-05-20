@@ -3700,10 +3700,27 @@ type projectImportRequest struct {
 	Bundle projectExportBundle `json:"bundle"`
 }
 
+type projectTokenCreateRequest struct {
+	Label string `json:"label"`
+}
+
 type cloudProjectResponse struct {
 	Project exportedProjectRecord `json:"project"`
 	TokenID string                `json:"token_id,omitempty"`
 	Token   string                `json:"token,omitempty"`
+}
+
+type exportedProjectAccessToken struct {
+	ID        string    `json:"id"`
+	ProjectID string    `json:"project_id"`
+	Label     string    `json:"label"`
+	CreatedAt time.Time `json:"created_at"`
+	RevokedAt time.Time `json:"revoked_at,omitempty"`
+}
+
+type cloudProjectTokenResponse struct {
+	AccessToken exportedProjectAccessToken `json:"access_token"`
+	Token       string                     `json:"token,omitempty"`
 }
 
 func serveCloud(registryPath, projectsBaseDir, addr, token string) error {
@@ -3840,6 +3857,14 @@ func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	if len(remainder) > 0 && remainder[0] == "tokens" {
+		if !authorizedToken(r, s.token) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		s.handleProjectTokens(w, r, project, remainder)
+		return
+	}
 	if !s.authorizedForProject(r, project) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -3861,6 +3886,42 @@ func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request,
 	next.Header.Set("X-ProMag-Token", s.token)
 	next.Header.Set("X-ProMag-Internal-Forward", "1")
 	newProjectServer(project, s.token).ServeHTTP(w, next)
+}
+
+func (s cloudServer) handleProjectTokens(w http.ResponseWriter, r *http.Request, project projectRecord, parts []string) {
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodGet:
+		tokens, err := loadProjectAccessTokens(s.registryPath, project.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		records := make([]exportedProjectAccessToken, 0, len(tokens))
+		for _, token := range tokens {
+			records = append(records, exportProjectAccessToken(token))
+		}
+		writeJSON(w, http.StatusOK, records)
+	case len(parts) == 1 && r.Method == http.MethodPost:
+		var req projectTokenCreateRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		_, tokenRecord, token, err := createProjectAccessToken(s.registryPath, project.ID, req.Label, s.actorID(r))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, cloudProjectTokenResponse{AccessToken: exportProjectAccessToken(tokenRecord), Token: token})
+	case len(parts) == 2 && r.Method == http.MethodDelete:
+		tokenRecord, err := revokeProjectAccessTokenForProject(s.registryPath, project.ID, parts[1], s.actorID(r))
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, cloudProjectTokenResponse{AccessToken: exportProjectAccessToken(tokenRecord)})
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
 }
 
 func (s cloudServer) actorID(r *http.Request) string {
@@ -6381,6 +6442,16 @@ func createProjectAccessToken(registryPath, projectID, label, actorID string) (p
 	return project, record, token, nil
 }
 
+func exportProjectAccessToken(token projectAccessToken) exportedProjectAccessToken {
+	return exportedProjectAccessToken{
+		ID:        token.ID,
+		ProjectID: token.ProjectID,
+		Label:     token.Label,
+		CreatedAt: token.CreatedAt,
+		RevokedAt: token.RevokedAt,
+	}
+}
+
 func insertProjectAccessToken(registryPath string, token projectAccessToken) error {
 	if strings.TrimSpace(token.ID) == "" {
 		return errors.New("token ID is required")
@@ -6416,13 +6487,29 @@ func revokeProjectAccessToken(registryPath, tokenID, actorID string) (projectAcc
 	if tokenID == "" {
 		return projectAccessToken{}, errors.New("token ID is required")
 	}
+	token, err := loadProjectAccessTokenByID(registryPath, tokenID)
+	if err != nil {
+		return projectAccessToken{}, err
+	}
+	return revokeProjectAccessTokenForProject(registryPath, token.ProjectID, tokenID, actorID)
+}
+
+func revokeProjectAccessTokenForProject(registryPath, projectID, tokenID, actorID string) (projectAccessToken, error) {
+	projectID = strings.TrimSpace(projectID)
+	tokenID = strings.TrimSpace(tokenID)
+	if projectID == "" {
+		return projectAccessToken{}, errors.New("project ID is required")
+	}
+	if tokenID == "" {
+		return projectAccessToken{}, errors.New("token ID is required")
+	}
 	db, err := openProjectRegistry(registryPath)
 	if err != nil {
 		return projectAccessToken{}, err
 	}
 	defer db.Close()
 	now := time.Now()
-	result, err := db.Exec(`UPDATE project_tokens SET revoked_at = ? WHERE id = ? AND revoked_at = ''`, now.Format(time.RFC3339Nano), tokenID)
+	result, err := db.Exec(`UPDATE project_tokens SET revoked_at = ? WHERE id = ? AND project_id = ? AND revoked_at = ''`, now.Format(time.RFC3339Nano), tokenID, projectID)
 	if err != nil {
 		return projectAccessToken{}, err
 	}
@@ -7071,6 +7158,7 @@ func helpManual(width int) string {
 		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
 		"Cloud project tokens are printed once; create with promag --cloud-token Ops --token-label laptop --data-dir .promag-cloud.",
 		"List or revoke project tokens with --cloud-tokens Ops or --cloud-revoke-token <token-id>.",
+		"Cloud admin HTTP can also manage project tokens at /projects/{id}/tokens.",
 		"Cloud backups: promag --cloud-backup backups/cloud.json --data-dir .promag-cloud and --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored.",
 		"HTTP servers write access logs to stdout; token create/revoke events appear in project activity.",
 		"Remote clients use project type remote, the server URL, and PROMAG_REMOTE_TOKEN for refreshes and writes.",

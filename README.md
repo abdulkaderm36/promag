@@ -288,6 +288,8 @@ go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored
 
 `--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token and token ID. Use the printed token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. Create one labeled token per person or device, list them with `--cloud-tokens`, and revoke a specific token ID with `--cloud-revoke-token`. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, and importing projects.
 
+The running cloud hub also exposes admin-only token management routes under `/projects/{id}/tokens`, so hosted deployments can create, list, and revoke per-project tokens through HTTP without direct filesystem access. Token list responses omit token hashes, and newly created raw tokens are only returned once.
+
 `--cloud-backup` writes one JSON file containing every cloud project's metadata, config, state, collaborators, activity, and project token hashes. Raw project tokens are not stored. `--cloud-restore` preserves project IDs and token hashes, including active and revoked token records, so existing remote URLs and project tokens continue to work, but it only restores into an empty cloud registry.
 
 The HTTP servers write one access log line per external request to stdout. Project token creation and revocation are also written to the project's activity log.
@@ -298,6 +300,9 @@ Cloud API routes are project-scoped:
 - `POST /projects`: create a project with `{"name":"Ops"}`; admin token required
 - `POST /projects/import`: import a JSON export bundle; admin token required
 - `GET /projects/{id}`: project metadata; admin or project token required
+- `GET /projects/{id}/tokens`: list project token metadata; admin token required
+- `POST /projects/{id}/tokens`: create a project token with `{"label":"manager laptop"}`; admin token required
+- `DELETE /projects/{id}/tokens/{token_id}`: revoke a project token; admin token required
 - `GET /projects/{id}/state`: project state, config, collaborators, and activity; admin or project token required
 - `GET /projects/{id}/export`: project JSON export bundle; admin or project token required
 - `POST /projects/{id}/tasks`, `PATCH /projects/{id}/tasks/{task_id}`, `DELETE /projects/{id}/tasks/{task_id}`; admin or project token required

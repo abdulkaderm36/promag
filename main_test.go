@@ -1058,6 +1058,118 @@ func TestProjectAccessTokensCanBeMultipleAndRevoked(t *testing.T) {
 	}
 }
 
+func TestCloudProjectTokenAdminHTTPLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	project, err := createCloudProject(registryPath, projectsBaseDir, nil, "HTTP Tokens")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, project.ID, "Project Client", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newCloudServer(registryPath, projectsBaseDir, "admin-secret")
+
+	projectTokenResp := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+project.ID+"/tokens", nil, projectToken, "manager-one")
+	if projectTokenResp.Code != http.StatusUnauthorized {
+		t.Fatalf("project token list status = %d body = %s, want unauthorized", projectTokenResp.Code, projectTokenResp.Body.String())
+	}
+
+	createResp := serveJSONRequestWithAuth(t, handler, http.MethodPost, "/projects/"+project.ID+"/tokens", mustJSON(t, projectTokenCreateRequest{
+		Label: "Manager Laptop",
+	}), "admin-secret", "admin-1")
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create token status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	var created cloudProjectTokenResponse
+	if err := json.Unmarshal(createResp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Token == "" || created.AccessToken.ID == "" || created.AccessToken.Label != "Manager Laptop" {
+		t.Fatalf("created token response = %#v", created)
+	}
+	if strings.Contains(createResp.Body.String(), "token_hash") || strings.Contains(createResp.Body.String(), hashToken(created.Token)) {
+		t.Fatalf("created token response exposed token hash: %s", createResp.Body.String())
+	}
+
+	listResp := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+project.ID+"/tokens", nil, "admin-secret", "admin-1")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list tokens status = %d body = %s", listResp.Code, listResp.Body.String())
+	}
+	var listed []exportedProjectAccessToken
+	if err := json.Unmarshal(listResp.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("listed tokens = %#v, want two", listed)
+	}
+	if strings.Contains(listResp.Body.String(), "token_hash") || strings.Contains(listResp.Body.String(), hashToken(created.Token)) {
+		t.Fatalf("list token response exposed token hash: %s", listResp.Body.String())
+	}
+
+	stateReq := httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/state", nil)
+	stateReq.Header.Set("Authorization", "Bearer "+created.Token)
+	stateResp := httptest.NewRecorder()
+	handler.ServeHTTP(stateResp, stateReq)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("new token state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+
+	revokeResp := serveJSONRequestWithAuth(t, handler, http.MethodDelete, "/projects/"+project.ID+"/tokens/"+created.AccessToken.ID, nil, "admin-secret", "admin-1")
+	if revokeResp.Code != http.StatusOK {
+		t.Fatalf("revoke token status = %d body = %s", revokeResp.Code, revokeResp.Body.String())
+	}
+	var revoked cloudProjectTokenResponse
+	if err := json.Unmarshal(revokeResp.Body.Bytes(), &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if revoked.AccessToken.ID != created.AccessToken.ID || revoked.AccessToken.RevokedAt.IsZero() {
+		t.Fatalf("revoked token response = %#v", revoked)
+	}
+
+	stateReq = httptest.NewRequest(http.MethodGet, "/projects/"+project.ID+"/state", nil)
+	stateReq.Header.Set("Authorization", "Bearer "+created.Token)
+	stateResp = httptest.NewRecorder()
+	handler.ServeHTTP(stateResp, stateReq)
+	if stateResp.Code != http.StatusUnauthorized {
+		t.Fatalf("revoked token state status = %d body = %s, want unauthorized", stateResp.Code, stateResp.Body.String())
+	}
+}
+
+func TestCloudProjectTokenAdminHTTPDoesNotRevokeOtherProjectsToken(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	firstProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "HTTP Token One")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "HTTP Token Two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondTokenRecord, secondToken, err := createProjectAccessToken(registryPath, secondProject.ID, "Other Project", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newCloudServer(registryPath, projectsBaseDir, "admin-secret")
+
+	revokeResp := serveJSONRequestWithAuth(t, handler, http.MethodDelete, "/projects/"+firstProject.ID+"/tokens/"+secondTokenRecord.ID, nil, "admin-secret", "admin-1")
+	if revokeResp.Code != http.StatusNotFound {
+		t.Fatalf("cross-project revoke status = %d body = %s, want not found", revokeResp.Code, revokeResp.Body.String())
+	}
+
+	stateReq := httptest.NewRequest(http.MethodGet, "/projects/"+secondProject.ID+"/state", nil)
+	stateReq.Header.Set("Authorization", "Bearer "+secondToken)
+	stateResp := httptest.NewRecorder()
+	handler.ServeHTTP(stateResp, stateReq)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("other project token status = %d body = %s, want still active", stateResp.Code, stateResp.Body.String())
+	}
+}
+
 func TestHTTPAccessLogging(t *testing.T) {
 	var log bytes.Buffer
 	previous := accessLogWriter
