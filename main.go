@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,9 @@ const (
 	storageSchemaKey   = "schema_version"
 	storageSchemaVer   = 2
 	localActorID       = "local"
+	configVersionKey   = "config_version"
+	configUpdatedAtKey = "config_updated_at"
+	configUpdatedByKey = "config_updated_by"
 	remoteTokenEnv     = "PROMAG_REMOTE_TOKEN"
 	remoteActorEnv     = "PROMAG_REMOTE_ACTOR"
 	remoteRefreshEvery = 5 * time.Second
@@ -159,8 +163,11 @@ type activityEvent struct {
 }
 
 type appConfig struct {
-	LeftWheelMode string `json:"left_wheel_mode"`
-	TaskSortMode  string `json:"task_sort_mode"`
+	LeftWheelMode string    `json:"left_wheel_mode"`
+	TaskSortMode  string    `json:"task_sort_mode"`
+	Version       int       `json:"version,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	UpdatedBy     string    `json:"updated_by,omitempty"`
 }
 
 type taskSortMode string
@@ -1367,10 +1374,20 @@ func (m model) handleSettingsForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
 		return m, nil
 	case "enter", "ctrl+s":
-		if err := m.saveConfigRecord(m.config); err != nil {
+		cfg, err := m.saveConfigRecord(m.config)
+		if err != nil {
+			if errors.Is(err, errVersionConflict) {
+				if reloadErr := m.reloadState(); reloadErr != nil {
+					m.setStatus("reload failed: " + reloadErr.Error())
+					return m, nil
+				}
+				m.setStatus("Settings changed elsewhere. Reloaded latest settings.")
+				return m, nil
+			}
 			m.setStatus(fmt.Sprintf("save config: %v", err))
 			return m, nil
 		}
+		m.config = cfg
 		m.closeOverlay("Settings saved.")
 		return m, nil
 	}
@@ -2939,10 +2956,20 @@ func (m model) deleteSelected() model {
 
 func (m model) cycleTaskSort() model {
 	m.config.TaskSortMode = string(nextTaskSortMode(m.config.taskSortMode()))
-	if err := m.saveConfigRecord(m.config); err != nil {
+	cfg, err := m.saveConfigRecord(m.config)
+	if err != nil {
+		if errors.Is(err, errVersionConflict) {
+			if reloadErr := m.reloadState(); reloadErr != nil {
+				m.setStatus("reload failed: " + reloadErr.Error())
+				return m
+			}
+			m.setStatus("Settings changed elsewhere. Reloaded latest settings.")
+			return m
+		}
 		m.setStatus("save failed: " + err.Error())
 		return m
 	}
+	m.config = cfg
 	m.cursor[viewTasks] = 0
 	m.cursor[viewArchive] = 0
 	m.listOffset[viewTasks] = 0
@@ -3664,7 +3691,8 @@ type memberWriteRequest struct {
 }
 
 type configWriteRequest struct {
-	Config appConfig `json:"config"`
+	Config          appConfig `json:"config"`
+	ExpectedVersion int       `json:"expected_version"`
 }
 
 type remoteRefreshMsg struct {
@@ -4107,13 +4135,9 @@ func (s projectServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if err := saveConfig(s.project.DBPath, req.Config); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	cfg, err := loadConfig(s.project.DBPath)
+	cfg, err := updateConfig(s.project.DBPath, req.Config, req.ExpectedVersion, s.actorID(r))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeStorageError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, cfg)
@@ -4482,7 +4506,7 @@ func (c remoteProjectClient) deleteMember(id string, expectedVersion int) error 
 
 func (c remoteProjectClient) saveConfig(cfg appConfig) (appConfig, error) {
 	var response appConfig
-	err := c.doJSON(http.MethodPatch, "/config", configWriteRequest{Config: cfg}, &response)
+	err := c.doJSON(http.MethodPatch, "/config", configWriteRequest{Config: cfg, ExpectedVersion: cfg.Version}, &response)
 	return response, err
 }
 
@@ -4698,19 +4722,22 @@ func (m model) setTaskArchivedRecord(id string, archived bool, expectedVersion i
 	return setTaskArchived(m.dbPath, id, archived, expectedVersion, localActorID)
 }
 
-func (m model) saveConfigRecord(cfg appConfig) error {
+func (m model) saveConfigRecord(cfg appConfig) (appConfig, error) {
 	if m.currentProject.Type == projectTypeRemote {
 		client, err := m.remoteClient()
 		if err != nil {
-			return err
+			return appConfig{}, err
 		}
 		remoteCfg, err := client.saveConfig(cfg)
 		if err != nil {
-			return err
+			return appConfig{}, err
 		}
-		return saveConfig(m.dbPath, remoteCfg)
+		if err := saveConfig(m.dbPath, remoteCfg); err != nil {
+			return appConfig{}, err
+		}
+		return remoteCfg, nil
 	}
-	return saveConfig(m.dbPath, cfg)
+	return updateConfig(m.dbPath, cfg, cfg.Version, localActorID)
 }
 
 func (m *model) reloadState() error {
@@ -4995,7 +5022,7 @@ func loadConfig(path string) (appConfig, error) {
 		return cfg, err
 	}
 
-	rows, err := db.Query(`SELECT key, value FROM config WHERE key IN ('left_wheel_mode', 'task_sort_mode')`)
+	rows, err := db.Query(`SELECT key, value FROM config WHERE key IN ('left_wheel_mode', 'task_sort_mode', ?, ?, ?)`, configVersionKey, configUpdatedAtKey, configUpdatedByKey)
 	if err != nil {
 		return cfg, err
 	}
@@ -5013,14 +5040,34 @@ func loadConfig(path string) (appConfig, error) {
 			cfg.LeftWheelMode = value
 		case "task_sort_mode":
 			cfg.TaskSortMode = value
+		case configVersionKey:
+			if parsed, err := strconv.Atoi(value); err == nil {
+				cfg.Version = parsed
+			}
+		case configUpdatedAtKey:
+			cfg.UpdatedAt, err = parseStoredTime(value)
+			if err != nil {
+				return cfg, err
+			}
+		case configUpdatedByKey:
+			cfg.UpdatedBy = value
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return cfg, err
 	}
-	if cfg.leftWheelMode() != cfg.LeftWheelMode || cfg.taskSortMode() != taskSortMode(cfg.TaskSortMode) || !seen["left_wheel_mode"] || !seen["task_sort_mode"] {
+	needsSave := cfg.leftWheelMode() != cfg.LeftWheelMode ||
+		cfg.taskSortMode() != taskSortMode(cfg.TaskSortMode) ||
+		!seen["left_wheel_mode"] ||
+		!seen["task_sort_mode"] ||
+		cfg.Version <= 0 ||
+		!seen[configVersionKey]
+	if needsSave {
 		cfg.LeftWheelMode = cfg.leftWheelMode()
 		cfg.TaskSortMode = string(cfg.taskSortMode())
+		if cfg.Version <= 0 {
+			cfg.Version = 1
+		}
 		return cfg, saveConfig(path, cfg)
 	}
 	return cfg, nil
@@ -5039,13 +5086,88 @@ func saveConfig(path string, cfg appConfig) error {
 	}
 	defer tx.Rollback()
 
-	if err := upsertConfig(tx, "left_wheel_mode", cfg.leftWheelMode()); err != nil {
-		return err
-	}
-	if err := upsertConfig(tx, "task_sort_mode", string(cfg.taskSortMode())); err != nil {
+	if err := writeConfigTx(tx, cfg); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func updateConfig(path string, cfg appConfig, expectedVersion int, actorID string) (appConfig, error) {
+	db, err := openStorage(path)
+	if err != nil {
+		return appConfig{}, err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return appConfig{}, err
+	}
+	defer tx.Rollback()
+
+	currentVersion, err := configVersionTx(tx)
+	if err != nil {
+		return appConfig{}, err
+	}
+	if currentVersion != normalizedVersion(expectedVersion) {
+		return appConfig{}, errVersionConflict
+	}
+	cfg.Version = currentVersion + 1
+	cfg.UpdatedAt = time.Now()
+	cfg.UpdatedBy = normalizeActorID(actorID)
+	if err := ensureCollaboratorTx(tx, cfg.UpdatedBy); err != nil {
+		return appConfig{}, err
+	}
+	if err := writeConfigTx(tx, cfg); err != nil {
+		return appConfig{}, err
+	}
+	if err := appendActivityTx(tx, cfg.UpdatedBy, "config.updated", "config", "project", "updated project settings"); err != nil {
+		return appConfig{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return appConfig{}, err
+	}
+	return cfg, nil
+}
+
+func writeConfigTx(tx *sql.Tx, cfg appConfig) error {
+	cfg.LeftWheelMode = cfg.leftWheelMode()
+	cfg.TaskSortMode = string(cfg.taskSortMode())
+	if cfg.Version <= 0 {
+		cfg.Version = 1
+	}
+	if cfg.UpdatedAt.IsZero() {
+		cfg.UpdatedAt = time.Now()
+	}
+	cfg.UpdatedBy = normalizeActorID(cfg.UpdatedBy)
+	if err := upsertConfig(tx, "left_wheel_mode", cfg.LeftWheelMode); err != nil {
+		return err
+	}
+	if err := upsertConfig(tx, "task_sort_mode", cfg.TaskSortMode); err != nil {
+		return err
+	}
+	if err := upsertConfig(tx, configVersionKey, fmt.Sprint(cfg.Version)); err != nil {
+		return err
+	}
+	if err := upsertConfig(tx, configUpdatedAtKey, formatStoredTime(cfg.UpdatedAt)); err != nil {
+		return err
+	}
+	return upsertConfig(tx, configUpdatedByKey, cfg.UpdatedBy)
+}
+
+func configVersionTx(tx *sql.Tx) (int, error) {
+	var value string
+	if err := tx.QueryRow(`SELECT value FROM config WHERE key = ?`, configVersionKey).Scan(&value); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 1, nil
+		}
+		return 0, err
+	}
+	version, err := strconv.Atoi(value)
+	if err != nil || version <= 0 {
+		return 1, nil
+	}
+	return version, nil
 }
 
 func saveState(path string, state appState) error {
@@ -5953,10 +6075,7 @@ func replaceConfig(tx *sql.Tx, cfg appConfig) error {
 	if _, err := tx.Exec(`DELETE FROM config`); err != nil {
 		return err
 	}
-	if err := upsertConfig(tx, "left_wheel_mode", cfg.leftWheelMode()); err != nil {
-		return err
-	}
-	return upsertConfig(tx, "task_sort_mode", string(cfg.taskSortMode()))
+	return writeConfigTx(tx, cfg)
 }
 
 func upsertConfig(tx *sql.Tx, key, value string) error {
@@ -7172,6 +7291,7 @@ func helpManual(width int) string {
 		"Legacy promag.sqlite3, promag-data.json, and promag-config.json are imported automatically when present.",
 		"Use s to open settings in-app.",
 		"Settings uses up/down or tab to switch options, then enter or ctrl+s to save.",
+		"Settings saves are version-checked when multiple clients edit the same project.",
 		"Due dates use YYYY-MM-DD. New task and quick note forms default to 7 days from today.",
 		"Task form supports comma-separated members and will create one task per member.",
 		"Mouse: click tabs or list rows, wheel to scroll.",

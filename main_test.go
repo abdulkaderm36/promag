@@ -407,6 +407,51 @@ func TestUpdateTaskDetectsStaleVersionAndLogsActivity(t *testing.T) {
 	}
 }
 
+func TestUpdateConfigDetectsStaleVersionAndLogsActivity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "project.sqlite3")
+	if err := saveConfig(path, defaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != 1 {
+		t.Fatalf("initial config version = %d, want 1", cfg.Version)
+	}
+
+	updatedCfg := cfg
+	updatedCfg.TaskSortMode = string(taskSortPriority)
+	updated, err := updateConfig(path, updatedCfg, cfg.Version, "manager-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 || updated.UpdatedBy != "manager-1" {
+		t.Fatalf("updated config metadata = version %d updated_by %q", updated.Version, updated.UpdatedBy)
+	}
+
+	staleCfg := cfg
+	staleCfg.TaskSortMode = string(taskSortTitle)
+	if _, err := updateConfig(path, staleCfg, cfg.Version, "manager-2"); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale config update error = %v, want errVersionConflict", err)
+	}
+
+	got, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.taskSortMode() != taskSortPriority || got.Version != 2 {
+		t.Fatalf("config after stale update = %#v, want priority version 2", got)
+	}
+	events, err := loadActivityLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasActivityAction(events, "config.updated") {
+		t.Fatalf("activity events = %#v, want config.updated", events)
+	}
+}
+
 func TestProjectServerRequiresAuthAndHandlesTaskConflicts(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
@@ -487,6 +532,56 @@ func TestProjectServerRequiresAuthAndHandlesTaskConflicts(t *testing.T) {
 	}
 	if len(state.ActivityLog) != 3 {
 		t.Fatalf("activity count = %d, want 3", len(state.ActivityLog))
+	}
+}
+
+func TestProjectServerHandlesConfigConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Config Remote", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newProjectServer(project, "secret")
+
+	stateResp := serveJSONRequest(t, handler, http.MethodGet, "/state", nil)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Config.Version != 1 {
+		t.Fatalf("initial config version = %d, want 1", state.Config.Version)
+	}
+
+	cfg := state.Config
+	cfg.TaskSortMode = string(taskSortPriority)
+	updateResp := serveJSONRequest(t, handler, http.MethodPatch, "/config", mustJSON(t, configWriteRequest{
+		Config:          cfg,
+		ExpectedVersion: state.Config.Version,
+	}))
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("config update status = %d body = %s", updateResp.Code, updateResp.Body.String())
+	}
+	var updated appConfig
+	if err := json.Unmarshal(updateResp.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 || updated.UpdatedBy != "manager-1" {
+		t.Fatalf("updated config = %#v, want version 2 manager-1", updated)
+	}
+
+	staleCfg := state.Config
+	staleCfg.TaskSortMode = string(taskSortTitle)
+	staleResp := serveJSONRequest(t, handler, http.MethodPatch, "/config", mustJSON(t, configWriteRequest{
+		Config:          staleCfg,
+		ExpectedVersion: state.Config.Version,
+	}))
+	if staleResp.Code != http.StatusConflict {
+		t.Fatalf("stale config status = %d body = %s, want conflict", staleResp.Code, staleResp.Body.String())
 	}
 }
 
@@ -956,6 +1051,46 @@ func TestRemoteProjectClientMapsCloudTaskActionConflicts(t *testing.T) {
 	}
 	if err := firstClient.deleteTask(deleteTask.ID, deleteTask.Version); !errors.Is(err, errVersionConflict) {
 		t.Fatalf("stale delete error = %v, want errVersionConflict", err)
+	}
+}
+
+func TestRemoteProjectClientMapsCloudConfigConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Config Conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, cloudProject.ID, "Shared", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
+	defer server.Close()
+
+	baseURL := server.URL + "/projects/" + cloudProject.ID
+	firstClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-one", client: server.Client()}
+	secondClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-two", client: server.Client()}
+
+	firstState, err := firstClient.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondState, err := secondClient.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCfg := secondState.Config
+	secondCfg.TaskSortMode = string(taskSortPriority)
+	if _, err := secondClient.saveConfig(secondCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	firstCfg := firstState.Config
+	firstCfg.TaskSortMode = string(taskSortTitle)
+	if _, err := firstClient.saveConfig(firstCfg); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale remote config update error = %v, want errVersionConflict", err)
 	}
 }
 

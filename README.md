@@ -114,6 +114,7 @@ go run . --cloud --addr :8080 --token "$PROMAG_SERVER_TOKEN" --data-dir .promag-
 ## Configuration
 
 Behavior settings are stored inside each project's SQLite database.
+Settings use the same optimistic version checks as tasks and members when saved through the TUI or HTTP API. If another client saves settings first, the local client reloads the latest version instead of overwriting it.
 
 Current settings:
 
