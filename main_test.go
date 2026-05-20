@@ -546,6 +546,66 @@ func TestRemoteProjectClientLoadsAndMutatesThroughServer(t *testing.T) {
 	}
 }
 
+func TestFetchAndCacheRemoteProjectPersistsCollaborationData(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, storageDir, registryFile)
+	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
+	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server Cache", projectTypeLocal, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newProjectServer(serverProject, "secret")
+	createResp := serveJSONRequestWithAuth(t, handler, http.MethodPost, "/tasks", mustJSON(t, taskWriteRequest{
+		Task: task{Title: "Cached collaboration task", Priority: "medium", Status: "open"},
+	}), "secret", "manager-server")
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create task status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	t.Setenv(remoteTokenEnv, "secret")
+	t.Setenv(remoteActorEnv, "manager-cache")
+	remoteProject := projectRecord{
+		ID:        "remote-cache",
+		Name:      "Remote Cache",
+		Type:      projectTypeRemote,
+		RemoteURL: server.URL,
+		DBPath:    filepath.Join(dir, "remote-cache.sqlite3"),
+	}
+	response, err := fetchAndCacheRemoteProject(remoteProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.State.Tasks) != 1 || response.State.Tasks[0].Title != "Cached collaboration task" {
+		t.Fatalf("remote response tasks = %#v", response.State.Tasks)
+	}
+	if !hasCollaborator(response.Collaborators, "manager-cache") {
+		t.Fatalf("remote response collaborators = %#v, want manager-cache", response.Collaborators)
+	}
+	if !hasActivityAction(response.ActivityLog, "task.created") {
+		t.Fatalf("remote response activity = %#v, want task.created", response.ActivityLog)
+	}
+
+	cachedState, err := loadState(remoteProject.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cachedState.Tasks) != 1 || cachedState.Tasks[0].Title != "Cached collaboration task" {
+		t.Fatalf("cached tasks = %#v", cachedState.Tasks)
+	}
+	cachedCollaborators, cachedActivity, err := loadProjectCollaborationData(remoteProject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCollaborator(cachedCollaborators, "manager-cache") {
+		t.Fatalf("cached collaborators = %#v, want manager-cache", cachedCollaborators)
+	}
+	if !hasActivityAction(cachedActivity, "task.created") {
+		t.Fatalf("cached activity = %#v, want task.created", cachedActivity)
+	}
+}
+
 func TestCloudServerCreatesListsAndScopesProjectRoutes(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
@@ -620,6 +680,81 @@ func TestCloudServerCreatesListsAndScopesProjectRoutes(t *testing.T) {
 	}
 }
 
+func TestCloudProjectTokensAreScopedAndForwardTaskConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	firstProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud One")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, firstToken, err := createProjectAccessToken(registryPath, firstProject.ID, "Manager One", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, secondToken, err := createProjectAccessToken(registryPath, secondProject.ID, "Manager Two", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newCloudServer(registryPath, projectsBaseDir, "admin-secret")
+
+	crossProject := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+secondProject.ID+"/state", nil, firstToken, "manager-one")
+	if crossProject.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-project token status = %d body = %s, want unauthorized", crossProject.Code, crossProject.Body.String())
+	}
+	wrongToken := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+firstProject.ID+"/state", nil, secondToken, "manager-two")
+	if wrongToken.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong project token status = %d body = %s, want unauthorized", wrongToken.Code, wrongToken.Body.String())
+	}
+
+	createResp := serveJSONRequestWithAuth(t, handler, http.MethodPost, "/projects/"+firstProject.ID+"/tasks", mustJSON(t, taskWriteRequest{
+		Task: task{Title: "Scoped task", Priority: "medium", Status: "open"},
+	}), firstToken, "manager-one")
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create task status = %d body = %s", createResp.Code, createResp.Body.String())
+	}
+	var created task
+	if err := json.Unmarshal(createResp.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	updatedTask := created
+	updatedTask.Title = "Scoped task updated"
+	updateResp := serveJSONRequestWithAuth(t, handler, http.MethodPatch, "/projects/"+firstProject.ID+"/tasks/"+created.ID, mustJSON(t, taskWriteRequest{
+		Task:            updatedTask,
+		ExpectedVersion: created.Version,
+	}), firstToken, "manager-two")
+	if updateResp.Code != http.StatusOK {
+		t.Fatalf("update task status = %d body = %s", updateResp.Code, updateResp.Body.String())
+	}
+
+	staleTask := created
+	staleTask.Title = "Stale overwrite"
+	staleResp := serveJSONRequestWithAuth(t, handler, http.MethodPatch, "/projects/"+firstProject.ID+"/tasks/"+created.ID, mustJSON(t, taskWriteRequest{
+		Task:            staleTask,
+		ExpectedVersion: created.Version,
+	}), firstToken, "manager-three")
+	if staleResp.Code != http.StatusConflict {
+		t.Fatalf("stale update status = %d body = %s, want conflict", staleResp.Code, staleResp.Body.String())
+	}
+
+	stateResp := serveJSONRequestWithAuth(t, handler, http.MethodGet, "/projects/"+firstProject.ID+"/state", nil, firstToken, "manager-one")
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("state status = %d body = %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state stateResponse
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.State.Tasks) != 1 || state.State.Tasks[0].Title != "Scoped task updated" {
+		t.Fatalf("cloud scoped tasks = %#v", state.State.Tasks)
+	}
+}
+
 func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
@@ -661,6 +796,43 @@ func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
 	}
 	if len(m.collaborators) == 0 || !hasCollaborator(m.collaborators, "manager-cloud") {
 		t.Fatalf("remote cloud collaborators = %#v, want manager-cloud", m.collaborators)
+	}
+}
+
+func TestRemoteProjectClientMapsCloudProjectConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, cloudProject.ID, "Shared", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
+	defer server.Close()
+
+	baseURL := server.URL + "/projects/" + cloudProject.ID
+	firstClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-one", client: server.Client()}
+	secondClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-two", client: server.Client()}
+
+	created, err := firstClient.createTask(task{Title: "Remote cloud conflict", Priority: "medium", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondUpdate := created
+	secondUpdate.Title = "Remote cloud conflict updated"
+	if _, err := secondClient.updateTask(secondUpdate, created.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	staleUpdate := created
+	staleUpdate.Title = "Remote stale overwrite"
+	_, err = firstClient.updateTask(staleUpdate, created.Version)
+	if !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale remote update error = %v, want errVersionConflict", err)
 	}
 }
 
@@ -1151,6 +1323,11 @@ func TestRecentActivityLinesUsesRelativeTime(t *testing.T) {
 
 func serveJSONRequest(t *testing.T, handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveJSONRequestWithAuth(t, handler, method, path, body, "secret", "manager-1")
+}
+
+func serveJSONRequestWithAuth(t *testing.T, handler http.Handler, method, path string, body []byte, token, actor string) *httptest.ResponseRecorder {
+	t.Helper()
 	var reader *bytes.Reader
 	if body == nil {
 		reader = bytes.NewReader(nil)
@@ -1158,8 +1335,8 @@ func serveJSONRequest(t *testing.T, handler http.Handler, method, path string, b
 		reader = bytes.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, reader)
-	req.Header.Set("Authorization", "Bearer secret")
-	req.Header.Set("X-ProMag-Actor", "manager-1")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-ProMag-Actor", actor)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
