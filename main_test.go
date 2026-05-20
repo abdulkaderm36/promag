@@ -904,6 +904,61 @@ func TestRemoteProjectClientMapsCloudProjectConflicts(t *testing.T) {
 	}
 }
 
+func TestRemoteProjectClientMapsCloudTaskActionConflicts(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Action Conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, cloudProject.ID, "Shared", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "secret"))
+	defer server.Close()
+
+	baseURL := server.URL + "/projects/" + cloudProject.ID
+	firstClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-one", client: server.Client()}
+	secondClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-two", client: server.Client()}
+
+	statusTask, err := firstClient.createTask(task{Title: "Status conflict", Priority: "medium", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secondClient.setTaskStatus(statusTask.ID, "done", statusTask.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstClient.setTaskStatus(statusTask.ID, "open", statusTask.Version); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale status error = %v, want errVersionConflict", err)
+	}
+
+	archiveTask, err := firstClient.createTask(task{Title: "Archive conflict", Priority: "medium", Status: "done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secondClient.setTaskArchived(archiveTask.ID, true, archiveTask.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstClient.setTaskArchived(archiveTask.ID, false, archiveTask.Version); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale archive error = %v, want errVersionConflict", err)
+	}
+
+	deleteTask, err := firstClient.createTask(task{Title: "Delete conflict", Priority: "medium", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteUpdate := deleteTask
+	deleteUpdate.Title = "Delete conflict updated"
+	if _, err := secondClient.updateTask(deleteUpdate, deleteTask.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstClient.deleteTask(deleteTask.ID, deleteTask.Version); !errors.Is(err, errVersionConflict) {
+		t.Fatalf("stale delete error = %v, want errVersionConflict", err)
+	}
+}
+
 func TestRemoteProjectClientMapsCloudMemberConflicts(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
