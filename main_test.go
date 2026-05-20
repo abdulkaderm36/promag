@@ -963,6 +963,116 @@ func TestRemoteProjectClientWorksWithCloudProjectURL(t *testing.T) {
 	}
 }
 
+func TestCloudCollaborationEndToEndBackupRestoreSmoke(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
+	projectsBaseDir := filepath.Join(dir, ".promag-cloud", projectsDir)
+	cloudProject, err := createCloudProject(registryPath, projectsBaseDir, nil, "Cloud Smoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, projectToken, err := createProjectAccessToken(registryPath, cloudProject.ID, "Shared", "admin-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(newCloudServer(registryPath, projectsBaseDir, "admin-secret"))
+	defer server.Close()
+
+	baseURL := server.URL + "/projects/" + cloudProject.ID
+	firstClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-one", client: server.Client()}
+	secondClient := remoteProjectClient{baseURL: baseURL, token: projectToken, actorID: "manager-two", client: server.Client()}
+
+	createdMember, err := firstClient.createMember(member{Name: "Nora Lee", Role: "Delivery Manager", Email: "nora@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdTask, err := secondClient.createTask(task{
+		Title:    "Coordinate launch plan",
+		MemberID: createdMember.ID,
+		Priority: "high",
+		Status:   "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateBeforeConfig, err := secondClient.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := stateBeforeConfig.Config
+	cfg.TaskSortMode = string(taskSortPriority)
+	savedCfg, err := secondClient.saveConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedCfg.Version != cfg.Version+1 || savedCfg.UpdatedBy != "manager-two" {
+		t.Fatalf("saved config = %#v, want incremented version by manager-two", savedCfg)
+	}
+
+	sharedState, err := firstClient.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedState.State.Members) != 1 || sharedState.State.Members[0].ID != createdMember.ID {
+		t.Fatalf("shared members = %#v", sharedState.State.Members)
+	}
+	if len(sharedState.State.Tasks) != 1 || sharedState.State.Tasks[0].ID != createdTask.ID || sharedState.State.Tasks[0].MemberID != createdMember.ID {
+		t.Fatalf("shared tasks = %#v", sharedState.State.Tasks)
+	}
+	if sharedState.Config.taskSortMode() != taskSortPriority || sharedState.Config.UpdatedBy != "manager-two" {
+		t.Fatalf("shared config = %#v, want priority updated by manager-two", sharedState.Config)
+	}
+	for _, actor := range []string{"manager-one", "manager-two"} {
+		if !hasCollaborator(sharedState.Collaborators, actor) {
+			t.Fatalf("shared collaborators = %#v, want %s", sharedState.Collaborators, actor)
+		}
+	}
+	for _, action := range []string{"token.created", "member.created", "task.created", "config.updated"} {
+		if !hasActivityAction(sharedState.ActivityLog, action) {
+			t.Fatalf("shared activity = %#v, want %s", sharedState.ActivityLog, action)
+		}
+	}
+
+	backupPath := filepath.Join(dir, "cloud-smoke-backup.json")
+	if err := backupCloudProjects(registryPath, backupPath); err != nil {
+		t.Fatal(err)
+	}
+	backupData, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(backupData, []byte(projectToken)) {
+		t.Fatal("cloud smoke backup contained raw project token")
+	}
+
+	restoreRegistryPath := filepath.Join(dir, ".promag-cloud-restored", registryFile)
+	restoreProjectsBaseDir := filepath.Join(dir, ".promag-cloud-restored", projectsDir)
+	if restoredCount, err := restoreCloudProjects(restoreRegistryPath, restoreProjectsBaseDir, backupPath); err != nil {
+		t.Fatal(err)
+	} else if restoredCount != 1 {
+		t.Fatalf("restored count = %d, want 1", restoredCount)
+	}
+	restoredServer := httptest.NewServer(newCloudServer(restoreRegistryPath, restoreProjectsBaseDir, "admin-secret"))
+	defer restoredServer.Close()
+	restoredClient := remoteProjectClient{baseURL: restoredServer.URL + "/projects/" + cloudProject.ID, token: projectToken, actorID: "manager-restored", client: restoredServer.Client()}
+	restoredState, err := restoredClient.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredState.State.Members) != 1 || restoredState.State.Members[0].ID != createdMember.ID {
+		t.Fatalf("restored members = %#v", restoredState.State.Members)
+	}
+	if len(restoredState.State.Tasks) != 1 || restoredState.State.Tasks[0].ID != createdTask.ID {
+		t.Fatalf("restored tasks = %#v", restoredState.State.Tasks)
+	}
+	if restoredState.Config.taskSortMode() != taskSortPriority || restoredState.Config.Version != savedCfg.Version {
+		t.Fatalf("restored config = %#v, want priority version %d", restoredState.Config, savedCfg.Version)
+	}
+	if !hasActivityAction(restoredState.ActivityLog, "config.updated") {
+		t.Fatalf("restored activity = %#v, want config.updated", restoredState.ActivityLog)
+	}
+}
+
 func TestRemoteProjectClientMapsCloudProjectConflicts(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, ".promag-cloud", registryFile)
