@@ -11,6 +11,9 @@ ProMag is a Bubble Tea-based project management TUI written in Go. It is built f
 - Capture multiple tasks quickly from plain-text notes
 - Persist each project locally in its own SQLite database file
 - Switch between projects and create new ones inside the TUI
+- Export and import project JSON backups
+- Collaborate through a single-project server or multi-project cloud hub
+- Track active collaborators, recent activity, and stale-write conflicts
 
 ## Requirements
 
@@ -74,7 +77,7 @@ promag
 - `--cloud-token <project-id-or-name>`
   - Creates and prints a cloud project access token
 - `--token-label <label>`
-  - Optional label for `--cloud-token`
+  - Optional label for tokens printed by `--cloud-create`, `--cloud-import`, or `--cloud-token`
 - `--cloud-tokens <project-id-or-name>`
   - Lists cloud project access token IDs, labels, and status
 - `--cloud-revoke-token <token-id>`
@@ -130,7 +133,7 @@ Current settings:
 You can change settings in either of these ways:
 
 1. In-app: press `s`, use `up` / `down` or `tab` / `shift+tab`, then press `enter` or `ctrl+s`
-2. Manually: inspect or edit the active project's `config` table in `.promag/projects/*.sqlite3`
+2. Manually: inspect or edit the active project's `config` table in `.promag/projects/*.sqlite3`; manual edits bypass version checks
 
 ## Controls
 
@@ -287,7 +290,7 @@ go run . --cloud-backup backups/cloud.json --data-dir .promag-cloud
 go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored
 ```
 
-`--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token and token ID. Use the printed token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. Create one labeled token per person or device, list them with `--cloud-tokens`, and revoke a specific token ID with `--cloud-revoke-token`. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, and importing projects.
+`--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token and token ID. Use the printed token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. Create one labeled token per person or device, list them with `--cloud-tokens`, and revoke a specific token ID with `--cloud-revoke-token`. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, importing, backing up, restoring, and managing project tokens.
 
 The running cloud hub also exposes admin-only token management routes under `/projects/{id}/tokens`, so hosted deployments can create, list, and revoke per-project tokens through HTTP without direct filesystem access. Token list responses omit token hashes, and newly created raw tokens are only returned once.
 
@@ -307,6 +310,7 @@ Cloud API routes are project-scoped:
 - `GET /projects/{id}/state`: project state, config, collaborators, and activity; admin or project token required
 - `GET /projects/{id}/export`: project JSON export bundle; admin or project token required
 - `POST /projects/{id}/tasks`, `PATCH /projects/{id}/tasks/{task_id}`, `DELETE /projects/{id}/tasks/{task_id}`; admin or project token required
+- `PATCH /projects/{id}/tasks/{task_id}/status`, `PATCH /projects/{id}/tasks/{task_id}/archive`; admin or project token required
 - `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{member_id}`, `DELETE /projects/{id}/members/{member_id}`; admin or project token required
 - `PATCH /projects/{id}/config`; admin or project token required
 

@@ -492,7 +492,7 @@ func main() {
 	cloudCreateFlag := flag.Bool("cloud-create", false, "create a cloud project: --cloud-create <project-name>")
 	cloudImportFlag := flag.Bool("cloud-import", false, "import JSON into the cloud data directory: --cloud-import <project-name> <input-path.json>")
 	cloudTokenFlag := flag.String("cloud-token", "", "create and print a cloud project access token: --cloud-token <project-id-or-name>")
-	cloudTokenLabelFlag := flag.String("token-label", "", "label for --cloud-token")
+	cloudTokenLabelFlag := flag.String("token-label", "", "label for tokens created by --cloud-create, --cloud-import, or --cloud-token")
 	cloudListTokensFlag := flag.String("cloud-tokens", "", "list cloud project access tokens: --cloud-tokens <project-id-or-name>")
 	cloudRevokeTokenFlag := flag.String("cloud-revoke-token", "", "revoke a cloud project access token by token ID")
 	cloudBackupFlag := flag.String("cloud-backup", "", "back up all cloud projects to JSON: --cloud-backup <output-path.json>")
@@ -7271,11 +7271,12 @@ func helpManual(width int) string {
 		"Projects",
 		"Press p to switch projects or create a new one inside the TUI.",
 		"ProMag remembers the last project you opened and restores it on the next launch.",
-		"Remote projects currently store remote_url metadata and still use a local cache DB.",
+		"Remote projects store remote_url metadata and keep a local cache DB.",
 		"CLI server mode: promag --serve Ops --addr :8080 --token <token> exposes the collaboration HTTP API.",
 		"Cloud hub mode: promag --cloud --addr :8080 --token <token> --data-dir .promag-cloud serves project-scoped APIs.",
 		"Cloud project setup: promag --cloud-create --data-dir .promag-cloud Ops or --cloud-import --data-dir .promag-cloud Ops backups/ops.json.",
 		"Cloud project tokens are printed once; create with promag --cloud-token Ops --token-label laptop --data-dir .promag-cloud.",
+		"Token labels can also be used when creating or importing cloud projects.",
 		"List or revoke project tokens with --cloud-tokens Ops or --cloud-revoke-token <token-id>.",
 		"Cloud admin HTTP can also manage project tokens at /projects/{id}/tokens.",
 		"Cloud backups: promag --cloud-backup backups/cloud.json --data-dir .promag-cloud and --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored.",
