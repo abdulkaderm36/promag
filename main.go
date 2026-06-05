@@ -3704,6 +3704,11 @@ type remoteRefreshMsg struct {
 type projectServer struct {
 	project projectRecord
 	token   string
+	// internalForward is set when the cloud hub invokes this server in-process
+	// for a project-scoped request. The hub already wrote one access log line,
+	// so the project server skips its own. It is a struct field rather than a
+	// request header so external clients cannot suppress access logging.
+	internalForward bool
 }
 
 type cloudServer struct {
@@ -3759,6 +3764,9 @@ func serveCloud(registryPath, projectsBaseDir, addr, token string) error {
 		Addr:              addr,
 		Handler:           newCloudServer(registryPath, projectsBaseDir, token),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	fmt.Fprintf(os.Stdout, "Serving ProMag cloud at http://%s\n", displayAddr(addr))
 	return server.ListenAndServe()
@@ -3880,13 +3888,21 @@ func (s cloudServer) handleProjectImport(w http.ResponseWriter, r *http.Request)
 }
 
 func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request, projectID string, remainder []string) {
+	admin := authorizedToken(r, s.token)
 	project, err := s.projectByID(projectID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		// Only the admin token is allowed to learn whether a project exists.
+		// Everyone else gets 401 regardless, so project IDs cannot be
+		// enumerated by probing for 404-vs-401 responses.
+		if admin {
+			writeError(w, http.StatusNotFound, err.Error())
+		} else {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+		}
 		return
 	}
 	if len(remainder) > 0 && remainder[0] == "tokens" {
-		if !authorizedToken(r, s.token) {
+		if !admin {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -3912,8 +3928,9 @@ func (s cloudServer) handleProjectScoped(w http.ResponseWriter, r *http.Request,
 	next.RequestURI = ""
 	next.Header = r.Header.Clone()
 	next.Header.Set("X-ProMag-Token", s.token)
-	next.Header.Set("X-ProMag-Internal-Forward", "1")
-	newProjectServer(project, s.token).ServeHTTP(w, next)
+	forwarded := newProjectServer(project, s.token)
+	forwarded.internalForward = true
+	forwarded.ServeHTTP(w, next)
 }
 
 func (s cloudServer) handleProjectTokens(w http.ResponseWriter, r *http.Request, project projectRecord, parts []string) {
@@ -4009,20 +4026,22 @@ func serveProject(project projectRecord, addr, token string) error {
 		Addr:              addr,
 		Handler:           newProjectServer(project, token),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
-	fmt.Fprintf(os.Stdout, "Serving project %q at http://%s\n", project.Name, addr)
+	fmt.Fprintf(os.Stdout, "Serving project %q at http://%s\n", project.Name, displayAddr(addr))
 	return server.ListenAndServe()
 }
 
-func newProjectServer(project projectRecord, token string) http.Handler {
+func newProjectServer(project projectRecord, token string) projectServer {
 	return projectServer{project: project, token: token}
 }
 
 func (s projectServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	recorder := newStatusRecorder(w)
 	start := time.Now()
-	internalForward := strings.TrimSpace(r.Header.Get("X-ProMag-Internal-Forward")) == "1"
-	if !internalForward {
+	if !s.internalForward {
 		defer logHTTPAccess("project", recorder, r, start, "project="+s.project.ID)
 	}
 	w = recorder
@@ -5687,7 +5706,12 @@ func normalizeActorID(actorID string) string {
 }
 
 func openStorage(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout makes concurrent writers wait for the lock instead of
+	// failing immediately, and _txlock=immediate upgrades database/sql's
+	// Begin() to BEGIN IMMEDIATE so two write transactions cannot deadlock
+	// while upgrading a read lock to a write lock (which returns SQLITE_BUSY
+	// regardless of busy_timeout). WAL lets readers run alongside the writer.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -6985,7 +7009,9 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	// See openStorage for why these pragmas matter under concurrent access;
+	// the registry is read on every cloud request and written by admin routes.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
