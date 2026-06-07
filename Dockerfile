@@ -13,10 +13,13 @@ FROM debian:bookworm-slim
 RUN useradd --system --create-home --home-dir /home/promag promag
 COPY --from=build /out/promag /usr/local/bin/promag
 
-RUN mkdir -p /data && chown -R promag:promag /data
+# The working directory holds ./data, which is the persistent volume. The default
+# --data-dir is ./data, so no command needs to pass it explicitly.
+WORKDIR /app
+RUN mkdir -p /app/data && chown -R promag:promag /app
 USER promag
 EXPOSE 8080
-VOLUME ["/data"]
+VOLUME ["/app/data"]
 
 ENTRYPOINT ["/usr/local/bin/promag"]
-CMD ["--cloud", "--addr", ":8080", "--data-dir", "/data"]
+CMD ["--cloud", "--addr", ":8080"]

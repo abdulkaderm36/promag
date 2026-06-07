@@ -116,7 +116,7 @@ func TestExportImportProjectBundleRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Ops", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Ops", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestExportImportPreservesCollaborationMetadata(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Collab", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Collab", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestProjectServerRequiresAuthAndHandlesTaskConflicts(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Remote Ops", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Remote Ops", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +540,7 @@ func TestProjectServerHandlesConfigConflicts(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Config Remote", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Config Remote", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,7 +590,7 @@ func TestRemoteProjectClientLoadsAndMutatesThroughServer(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server", projectTypeLocal, "")
+	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +646,7 @@ func TestFetchAndCacheRemoteProjectPersistsCollaborationData(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server Cache", projectTypeLocal, "")
+	serverProject, err := createProjectRecord(registryPath, projectsBaseDir, "Server Cache", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1799,7 +1799,7 @@ func TestProjectServerTouchesCollaboratorOnRead(t *testing.T) {
 	dir := t.TempDir()
 	registryPath := filepath.Join(dir, storageDir, registryFile)
 	projectsBaseDir := filepath.Join(dir, storageDir, projectsDir)
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Presence", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Presence", projectTypeLocal, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

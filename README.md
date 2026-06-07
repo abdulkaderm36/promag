@@ -70,6 +70,10 @@ promag
   - Serves a project over a token-authenticated HTTP API for collaboration clients
 - `--cloud`
   - Serves all projects from a cloud data directory over project-scoped collaboration APIs
+- `--cloud-init`
+  - Writes a config file (`promag.env`) into the data directory with the admin token and public URL, generating a strong token if none is set. Handy for the binary/no-Docker setup; the Docker setup uses a `.env` file instead (see below).
+- `--cloud-admin`
+  - Opens an interactive admin TUI to browse projects, create projects, and mint or revoke per-user tokens (with connection strings) without long commands
 - `--cloud-create <project-name>`
   - Creates a project in the cloud data directory
 - `--cloud-import <project-name> <path.json>`
@@ -87,13 +91,15 @@ promag
 - `--cloud-restore <path.json>`
   - Restores all cloud projects from a JSON backup into an empty cloud data directory
 - `--data-dir <path>`
-  - Data directory for cloud commands; defaults to `.promag-cloud`
+  - Data directory for cloud commands; defaults to `./data`. In Docker this is the mounted volume, so you never pass it.
 - `--addr <host:port>`
   - Address for `--serve` or `--cloud`; defaults to `:8080`
 - `--token <token>`
-  - Bearer token for `--serve` or `--cloud`; can also be set with `PROMAG_SERVER_TOKEN`
+  - Admin/bearer token for `--serve` or `--cloud`. Resolved as flag → `PROMAG_SERVER_TOKEN` env → `promag.env` in the data directory. In Docker the token comes from your `.env` file (injected as `PROMAG_SERVER_TOKEN`).
+- `--public-url <url>`
+  - Public base URL used in the connection strings printed by the cloud commands, for example `https://promag.example.com`. Resolved as flag → `PROMAG_PUBLIC_URL` env → `promag.env`, defaulting to the address from `--addr`. In Docker it comes from your `.env` file.
 
-Remote project clients use `remote_url` plus `PROMAG_REMOTE_TOKEN` for authentication. Set `PROMAG_REMOTE_ACTOR` to control the collaborator ID sent with refreshes and writes.
+`--cloud-create`, `--cloud-import`, and `--cloud-token` print a **connection string** (an invite). A teammate pastes that one string into ProMag and the remote URL and token are filled in for them — there is normally no need to set `PROMAG_REMOTE_TOKEN` by hand. The token is stored locally with the project. `PROMAG_REMOTE_TOKEN` still works as an override, and `PROMAG_REMOTE_ACTOR` controls the collaborator ID sent with refreshes and writes.
 
 Examples:
 
@@ -104,14 +110,15 @@ go run . --debug --debug-hitboxes
 go run . --export Ops backups/ops.json
 go run . --import "Restored Project" backups/ops.json
 go run . --serve Ops --addr :8080 --token "$PROMAG_SERVER_TOKEN"
-go run . --cloud-create --data-dir .promag-cloud Ops
-go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
-go run . --cloud-token Ops --token-label "manager laptop" --data-dir .promag-cloud
-go run . --cloud-tokens Ops --data-dir .promag-cloud
-go run . --cloud-revoke-token tok_example --data-dir .promag-cloud
-go run . --cloud-backup backups/cloud.json --data-dir .promag-cloud
-go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud
-go run . --cloud --addr :8080 --token "$PROMAG_SERVER_TOKEN" --data-dir .promag-cloud
+go run . --cloud-init --public-url https://promag.example.com   # writes ./data/promag.env
+go run . --cloud-create Ops
+go run . --cloud-import Ops backups/ops.json
+go run . --cloud-token Ops --token-label "manager laptop"
+go run . --cloud-tokens Ops
+go run . --cloud-revoke-token tok_example
+go run . --cloud-backup backups/cloud.json
+go run . --cloud-restore backups/cloud.json --data-dir ./restored   # restore needs an empty dir
+go run . --cloud --addr :8080
 ```
 
 ## Configuration
@@ -262,11 +269,15 @@ Main API routes:
 
 Write requests use optimistic versions. Send the version last seen as `expected_version`; stale writes return HTTP `409 Conflict`.
 
-To connect from another ProMag TUI instance:
+To connect from another ProMag TUI instance, the easiest path is to paste a
+connection string (printed by the cloud commands below). For a plain `--serve`
+project you can also configure it by hand:
 
-1. Create or edit a project with type `remote`
+1. Press `p`, create a project, and set its type to `remote`
 2. Set the remote URL to the server, for example `http://localhost:8080`
-3. Start the TUI with `PROMAG_REMOTE_TOKEN=<token>`
+3. Set the token in the form's Token field (or start the TUI with `PROMAG_REMOTE_TOKEN=<token>`)
+
+The token is saved with the project, so you only enter it once.
 
 Remote projects load and write through the server API. A local cache database is still kept under `.promag/projects/` so the project appears in the project switcher and can reload server state when opened. While a remote project is active, ProMag refreshes server state every few seconds, updates collaborator `last_seen_at` through authenticated requests, and shows active collaborators plus recent activity in the detail pane.
 
@@ -275,22 +286,29 @@ Remote projects load and write through the server API. A local cache database is
 Run a multi-project cloud hub when several clients need to connect to shared projects through one hosted server:
 
 ```bash
-PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)" go run . --cloud --addr :8080 --data-dir .promag-cloud
+go run . --cloud-init --public-url https://promag.example.com   # writes ./data/promag.env once
+go run . --cloud --addr :8080
 ```
 
-Create or import projects into the cloud data directory:
+Create or manage projects in the data directory (defaults to `./data`):
 
 ```bash
-go run . --cloud-create --data-dir .promag-cloud Ops
-go run . --cloud-import --data-dir .promag-cloud Ops backups/ops.json
-go run . --cloud-token Ops --token-label "manager laptop" --data-dir .promag-cloud
-go run . --cloud-tokens Ops --data-dir .promag-cloud
-go run . --cloud-revoke-token tok_example --data-dir .promag-cloud
-go run . --cloud-backup backups/cloud.json --data-dir .promag-cloud
-go run . --cloud-restore backups/cloud.json --data-dir .promag-cloud-restored
+go run . --cloud-admin                       # interactive: projects + per-user tokens
+go run . --cloud-create Ops
+go run . --cloud-import Ops backups/ops.json
+go run . --cloud-token Ops --token-label "manager laptop"
+go run . --cloud-tokens Ops
+go run . --cloud-revoke-token tok_example
+go run . --cloud-backup backups/cloud.json
+go run . --cloud-restore backups/cloud.json --data-dir ./restored
 ```
 
-`--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token and token ID. Use the printed token as `PROMAG_REMOTE_TOKEN` for clients that should only access that project. Create one labeled token per person or device, list them with `--cloud-tokens`, and revoke a specific token ID with `--cloud-revoke-token`. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, importing, backing up, restoring, and managing project tokens.
+For managing several projects or onboarding many users, run the interactive
+admin TUI with `--cloud-admin` (see the Self-Hosting Guide, Step 7). It browses
+projects, creates them, and mints per-user tokens — pasting a whole list of
+usernames at once — without typing a command per token.
+
+`--cloud-create`, `--cloud-import`, and `--cloud-token` print a project token, a token ID, and a **connection string**. Share the connection string with one teammate; they paste it into ProMag and the remote URL and token are filled in automatically (no `PROMAG_REMOTE_TOKEN` needed). Pass `--public-url https://your-host` so the connection string points at your real, externally reachable address instead of `localhost`. Create one labeled token per person or device, list them with `--cloud-tokens`, and revoke a specific token ID with `--cloud-revoke-token`. The hub token from `--token` or `PROMAG_SERVER_TOKEN` remains the admin token for listing, creating, importing, backing up, restoring, and managing project tokens.
 
 The running cloud hub also exposes admin-only token management routes under `/projects/{id}/tokens`, so hosted deployments can create, list, and revoke per-project tokens through HTTP without direct filesystem access. Token list responses omit token hashes, and newly created raw tokens are only returned once.
 
@@ -314,39 +332,55 @@ Cloud API routes are project-scoped:
 - `POST /projects/{id}/members`, `PATCH /projects/{id}/members/{member_id}`, `DELETE /projects/{id}/members/{member_id}`; admin or project token required
 - `PATCH /projects/{id}/config`; admin or project token required
 
-To connect a TUI client to a cloud project, create or edit a `remote` project and set its remote URL to `http://localhost:8080/projects/{id}`. Use the deployed host name instead of `localhost` when the hub is running on a server, and set `PROMAG_REMOTE_TOKEN` to that project's token.
+To connect a TUI client to a cloud project, press `p` to open the project
+switcher, create a project, and paste the connection string into the Name
+field — ProMag fills in the rest and saves the token locally. To configure it by
+hand instead, set the project type to `remote`, set the remote URL to
+`http://localhost:8080/projects/{id}` (use the deployed host name when the hub is
+on a server), and put the project token in the form's Token field.
 
 ### Docker Deployment
 
-The repository includes a `Dockerfile` and `docker-compose.yml` for running the cloud hub as a service.
+The repository includes a `Dockerfile`, `docker-compose.yml`, and `.env.example`
+for running the cloud hub as a service.
 
-Build and start the hub:
-
-```bash
-export PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)"
-docker compose up --build -d
-```
-
-The compose file stores cloud project data in the named Docker volume `promag-cloud-data`, mounted at `/data` inside the container. Do not run the cloud hub without a persistent volume, or project databases will be lost when the container is replaced.
-
-Create or import cloud projects by running one-off commands against the same volume:
+Set your config once, then start the hub:
 
 ```bash
-docker compose run --rm promag-cloud --cloud-create --data-dir /data Ops
-docker compose run --rm -v "$PWD/backups:/imports:ro" promag-cloud --cloud-import --data-dir /data Ops /imports/ops.json
-docker compose run --rm promag-cloud --cloud-token Ops --token-label "manager laptop" --data-dir /data
-docker compose run --rm promag-cloud --cloud-tokens Ops --data-dir /data
-docker compose run --rm promag-cloud --cloud-revoke-token tok_example --data-dir /data
-docker compose run --rm -v "$PWD/backups:/backups" promag-cloud --cloud-backup /backups/cloud.json --data-dir /data
+cp .env.example .env
+# edit .env: set PROMAG_SERVER_TOKEN (e.g. openssl rand -hex 24) and PROMAG_PUBLIC_URL
+docker compose up -d
 ```
 
-For a remote client, use:
+Compose reads `.env`, injects the token and public URL into the container, and
+stores all project data in the named volume `promag-cloud-data` (mounted at
+`./data` inside the container — the default data directory, so no command ever
+passes `--data-dir`). Do not run the hub without the volume, or projects are lost
+when the container is replaced.
+
+When you need to add projects or users, run the admin TUI through the same
+service:
 
 ```bash
-PROMAG_REMOTE_TOKEN="<project-token>" promag
+docker compose run --rm -it promag-cloud --cloud-admin
 ```
 
-Then create or edit a `remote` project and set the remote URL to `http://<host>:8080/projects/<project-id>`.
+Or run individual one-off commands (no `--data-dir`, no token to pass — both come
+from the volume and `.env`):
+
+```bash
+docker compose run --rm promag-cloud --cloud-create Ops
+docker compose run --rm -v "$PWD/backups:/imports:ro" promag-cloud --cloud-import Ops /imports/ops.json
+docker compose run --rm promag-cloud --cloud-token Ops --token-label "manager laptop"
+docker compose run --rm promag-cloud --cloud-tokens Ops
+docker compose run --rm promag-cloud --cloud-revoke-token tok_example
+docker compose run --rm -v "$PWD/backups:/backups" promag-cloud --cloud-backup /backups/cloud.json
+```
+
+Pass `--public-url https://<host>` to `--cloud-create`/`--cloud-token` so the
+printed connection string points at your real host. Then a teammate just runs
+`promag`, presses `p`, and pastes the connection string — no environment
+variables to set.
 
 ## Self-Hosting Guide (Start to Finish)
 
@@ -359,18 +393,18 @@ alternative is covered at the end.
 
 - One **cloud hub** process (`--cloud`) that serves every project over an
   HTTP API and stores all data in a single data directory (a Docker volume).
-- One **admin token** (`PROMAG_SERVER_TOKEN`) that manages the hub: listing,
-  creating, importing, backing up, restoring projects, and minting per-project
-  tokens.
+- One **admin token**, stored in `promag.env` inside the data directory, that
+  manages the hub: listing, creating, importing, backing up, restoring projects,
+  and minting per-project tokens.
 - One or more **project tokens**, one per person or device, that each grant
-  access to a single project. These are what your teammates put in
-  `PROMAG_REMOTE_TOKEN`.
-- Each teammate runs the normal ProMag TUI and adds a `remote` project that
-  points at the hub.
+  access to a single project. You hand each one to a teammate as a single
+  **connection string** they paste into ProMag.
+- Each teammate runs the normal ProMag TUI and pastes the connection string to
+  add a `remote` project that points at the hub.
 
 ```
- teammate TUI ──PROMAG_REMOTE_TOKEN──▶ reverse proxy (HTTPS) ──▶ cloud hub ──▶ /data volume
- teammate TUI ──PROMAG_REMOTE_TOKEN──▶        :443                  :8080        (SQLite)
+ teammate TUI ──paste connection string──▶ reverse proxy (HTTPS) ──▶ cloud hub ──▶ /data volume
+ teammate TUI ──paste connection string──▶        :443                  :8080        (SQLite)
 ```
 
 ### Prerequisites
@@ -390,37 +424,39 @@ cd promag
 The repository already contains the `Dockerfile` and `docker-compose.yml` used
 below.
 
-### Step 2 — Generate and store the admin token
+### Step 2 — Set your config (`.env`)
 
-The admin token is the master credential for the hub. Generate a strong one and
-keep it somewhere safe (a password manager or your secrets store):
-
-```bash
-export PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)"
-echo "$PROMAG_SERVER_TOKEN"   # copy this somewhere safe
-```
-
-The `docker-compose.yml` reads `PROMAG_SERVER_TOKEN` from your environment and
-refuses to start without it. For a persistent deployment, put it in a `.env`
-file next to `docker-compose.yml` instead of relying on your shell:
+Configuration lives in a `.env` file next to `docker-compose.yml`. Copy the
+example and fill in your own values:
 
 ```bash
-echo "PROMAG_SERVER_TOKEN=$PROMAG_SERVER_TOKEN" > .env
-chmod 600 .env
+cp .env.example .env
 ```
 
-`.env` is read automatically by Docker Compose. Do not commit it.
+Edit `.env`:
+
+```ini
+# the master credential — generate one with: openssl rand -hex 24
+PROMAG_SERVER_TOKEN=paste-a-long-random-token-here
+# the address teammates reach the hub at (your HTTPS host from Step 5)
+PROMAG_PUBLIC_URL=https://promag.example.com
+```
+
+Keep `PROMAG_SERVER_TOKEN` safe — it is the admin master credential. `.env` is
+git-ignored. (While testing you can set `PROMAG_PUBLIC_URL=http://<server-ip>:8080`
+and change it later.)
 
 ### Step 3 — Start the hub
 
 ```bash
-docker compose up --build -d
+docker compose up -d
 ```
 
-This builds the image and starts the `promag-cloud` service listening on
-`:8080`, with data persisted in the named volume `promag-cloud-data` (mounted at
-`/data` in the container). The volume is what keeps your projects across
-restarts and image rebuilds — never run the hub without it.
+This starts the `promag-cloud` service on `:8080`. Compose reads `.env` and
+injects your token and public URL; data is persisted in the named volume
+`promag-cloud-data`, mounted at `./data` inside the container (the default data
+directory — that's why no command needs `--data-dir`). The volume is what keeps
+your projects across restarts and image rebuilds — never run the hub without it.
 
 Verify it is healthy (the `/health` route needs no authentication):
 
@@ -437,28 +473,35 @@ docker compose logs -f promag-cloud
 
 ### Step 4 — Create your first project and token
 
-Run one-off CLI commands inside the same volume. Because these commands need the
-data directory but not the running server, use `docker compose run`:
+You can create a project from the command line with `docker compose run` (the
+admin TUI in Step 7 is the friendlier way for many projects/users). The data
+directory and public URL come from the volume and `.env`, so you don't repeat
+them:
 
 ```bash
-docker compose run --rm promag-cloud --cloud-create --data-dir /data Ops
+docker compose run --rm promag-cloud --cloud-create Ops
 ```
 
-This prints the project ID, its remote URL, a token ID, and a project token. The
-**project token is shown only once** — copy it immediately. Example output:
+This prints the project ID, remote URL, token ID, project token, and a
+**connection string**. The token and connection string are shown **only once** —
+copy the connection string immediately; it is the single thing you hand to a
+teammate. Example output:
 
 ```
 Created cloud project "Ops" (prj_...)
-Remote URL: http://localhost:8080/projects/prj_...
+Remote URL: https://promag.example.com/projects/prj_...
 Project token ID: tok_...
-Project token: 6f1c... (64 hex chars)
+Project token: 6f1c... (48 hex chars)
+
+Connection string (share with one teammate; they paste it into ProMag):
+promag://join/eyJ2IjoxLCJ1cmwiOiJodHRwczovL3Byb21hZy5leGFtcGxl...
 ```
 
 To seed a project from an existing JSON export instead of an empty one:
 
 ```bash
 docker compose run --rm -v "$PWD/backups:/imports:ro" \
-  promag-cloud --cloud-import --data-dir /data Ops /imports/ops.json
+  promag-cloud --cloud-import Ops /imports/ops.json
 ```
 
 ### Step 5 — Put the hub behind HTTPS (important)
@@ -484,44 +527,88 @@ use `https://promag.example.com` as the host.
 ### Step 6 — Connect a client
 
 On each teammate's machine, install or build ProMag (see **Build And Install**),
-then start it with that person's project token:
+then run it:
 
 ```bash
-PROMAG_REMOTE_TOKEN="<project-token>" \
-PROMAG_REMOTE_ACTOR="ali@laptop" \
 promag
 ```
 
 Inside the TUI:
 
-1. Press `p` to open the project switcher and create a new project.
-2. Set its type to `remote`.
-3. Set the remote URL to the hub address plus the project path, for example
-   `https://promag.example.com/projects/<project-id>` (or
-   `http://<host>:8080/projects/<project-id>` if you are testing without a
-   proxy).
-4. Open the project. ProMag loads server state, keeps a local cache under
-   `.promag/projects/`, refreshes every few seconds, and shows active
-   collaborators and recent activity.
+1. Press `p` to open the project switcher, then `n` to create a new project.
+2. Paste the connection string into the **Name** field.
+3. Press `ctrl+s` to save.
 
-`PROMAG_REMOTE_ACTOR` is optional but recommended — it labels this person/device
-in the collaborator list and activity log. If unset, a local default is used.
+That's it — ProMag recognizes the connection string, creates a `remote` project,
+fills in the URL, stores the token locally (so no environment variable is
+needed), keeps a local cache under `.promag/projects/`, refreshes every few
+seconds, and shows active collaborators and recent activity.
 
-### Step 7 — Add teammates (one token per person or device)
+To label who is connecting in the collaborator list and activity log, set
+`PROMAG_REMOTE_ACTOR` before launching (optional but recommended):
 
-Mint a separate, labeled token for each person or device so you can revoke them
-individually:
+```bash
+PROMAG_REMOTE_ACTOR="ali@laptop" promag
+```
+
+> **Manual alternative.** If you prefer not to use a connection string, create
+> the project, set its type to `remote`, set the remote URL to
+> `https://promag.example.com/projects/<project-id>`, and paste the raw token
+> into the form's **Token** field. The env var `PROMAG_REMOTE_TOKEN` still works
+> as an override for advanced setups.
+
+### Step 7 — Add teammates (admin TUI — recommended)
+
+When you have several projects or many users, managing tokens with one long
+command each gets tedious. The **admin TUI** does it interactively — browse
+projects, create projects, and mint a per-user token (each with its own
+connection string) for any of them:
+
+```bash
+docker compose run --rm -it promag-cloud --cloud-admin
+```
+
+(The `-it` flags give the container a terminal. For the binary, just run
+`./promag --cloud-admin --data-dir /var/lib/promag`. The public URL comes from
+`promag.env`.)
+
+Inside the admin TUI:
+
+- **Projects screen** — `↑/↓` select, `enter` to manage, `n` to create a new
+  project, `q` to quit.
+- **Manage screen** — see the project's tokens; press `a` to add users.
+- **Add users** — paste a whole list (one username per line, or comma-separated)
+  and press `ctrl+s`. One token and one connection string are created per name.
+- **Connection strings** — press `e` to export them to a `invites-<project>.txt`
+  file (mode `600`). Every string created in the session is also printed to your
+  terminal when you quit, so nothing is lost.
+- **Revoke** — on the manage screen, select a token and press `r`.
+
+Hand each user their connection string; they connect exactly as in Step 6
+(`promag` → `p` → `n` → paste → save). This is the whole "add 100 users across
+projects" workflow: one screen for you, one paste for each of them.
+
+> **Shared-token shortcut.** A token is *not* tied to one person — multiple
+> people can use the same connection string at once and still appear as distinct
+> collaborators (identity comes from `PROMAG_REMOTE_ACTOR` or their username). So
+> if you don't need to revoke individuals, create **one** token and share its
+> connection string with everyone. Per-user tokens only matter when you need to
+> cut off one person without rotating everyone.
+
+#### One-off CLI alternative
+
+To mint a single token without the TUI (prints one connection string):
 
 ```bash
 docker compose run --rm promag-cloud \
-  --cloud-token Ops --token-label "ali laptop" --data-dir /data
+  --cloud-token Ops --token-label "ali laptop"
 ```
 
 List and revoke tokens as people come and go:
 
 ```bash
-docker compose run --rm promag-cloud --cloud-tokens Ops --data-dir /data
-docker compose run --rm promag-cloud --cloud-revoke-token tok_... --data-dir /data
+docker compose run --rm promag-cloud --cloud-tokens Ops
+docker compose run --rm promag-cloud --cloud-revoke-token tok_...
 ```
 
 A running hub can also manage tokens over HTTP with the admin token, without
@@ -550,7 +637,7 @@ project token hashes — raw tokens are never stored) to a single JSON file:
 
 ```bash
 docker compose run --rm -v "$PWD/backups:/backups" \
-  promag-cloud --cloud-backup /backups/cloud.json --data-dir /data
+  promag-cloud --cloud-backup /backups/cloud.json
 ```
 
 Restore preserves project IDs and token hashes, so existing remote URLs and
@@ -558,7 +645,7 @@ tokens keep working — but it only restores into an **empty** data directory:
 
 ```bash
 docker compose run --rm -v "$PWD/backups:/backups:ro" \
-  promag-cloud --cloud-restore /backups/cloud.json --data-dir /data
+  promag-cloud --cloud-restore /backups/cloud.json
 ```
 
 Schedule the backup command (for example via `cron`) and copy the resulting
@@ -577,42 +664,50 @@ alongside each database — leave them in place; they are part of the database.
 
 ### No-Docker alternative
 
-You can run the same hub directly from a built binary. Pick a data directory,
-keep the admin token in the environment, and run it (ideally behind the same
-reverse proxy, and under a process manager such as systemd):
+You can run the same hub directly from a built binary. Pick a data directory and
+run it (ideally behind the same reverse proxy, and under a process manager such
+as systemd). The config file lives in that directory, so the token and public
+URL are set once:
 
 ```bash
 go build -o promag .
 
-# one-time setup
-export PROMAG_SERVER_TOKEN="$(openssl rand -hex 24)"
+# one-time setup: writes /var/lib/promag/promag.env with a generated token
+./promag --cloud-init --data-dir /var/lib/promag --public-url https://promag.example.com
 ./promag --cloud-create --data-dir /var/lib/promag Ops
 ./promag --cloud-token Ops --token-label "ali laptop" --data-dir /var/lib/promag
 
-# run the hub
+# run the hub (reads token + public URL from the config file)
 ./promag --cloud --addr :8080 --data-dir /var/lib/promag
 ```
 
-All the `--cloud-*` commands above work the same way; just swap
-`docker compose run --rm promag-cloud` for `./promag` and `/data` for your data
-directory.
+All the `--cloud-*` commands work the same way; just swap
+`docker compose run --rm promag-cloud` for `./promag` and pass your
+`--data-dir`. (In Docker the data directory defaults to `./data` in the volume,
+so you never pass it there.)
 
 ### Troubleshooting
 
-- **`cloud token is required`** — `PROMAG_SERVER_TOKEN` (or `--token`) is not set
-  for the hub or the admin CLI command.
-- **`401 unauthorized` from a client** — the project token is wrong, revoked, or
-  not set in `PROMAG_REMOTE_TOKEN`; or the remote URL points at the wrong
-  project ID.
+- **`cloud token is required`** — no token is configured. In Docker, set
+  `PROMAG_SERVER_TOKEN` in `.env`. For the binary, run `--cloud-init` first or set
+  `PROMAG_SERVER_TOKEN` / `--token`.
+- **`set PROMAG_SERVER_TOKEN in .env`** (from `docker compose`) — you have not
+  created `.env` yet. `cp .env.example .env` and set a token.
+- **`401 unauthorized` from a client** — the project token is wrong or revoked,
+  or the remote URL points at the wrong project ID. Re-mint a token with
+  `--cloud-token` and paste the fresh connection string.
+- **`remote token is required`** — the project has no stored token and no
+  `PROMAG_REMOTE_TOKEN` is set. Re-create the project by pasting the connection
+  string, or paste the token into the form's Token field.
 - **`404` only with the admin token** — the project ID does not exist. Without
   the admin token, unknown and unauthorized projects both return `401` so IDs
   cannot be probed.
 - **Client cannot reach the hub** — confirm `curl https://<host>/health` returns
   `{"status":"ok"}` from the client's network, and that your firewall exposes the
   proxy port (443), not 8080 directly.
-- **Data disappeared after an update** — the hub was run without the persistent
-  volume/data directory. Always pass the same `--data-dir` (or keep the named
-  Docker volume).
+- **Data disappeared after an update** — the hub ran without the persistent
+  volume. Keep the named Docker volume (or, for the binary, always point
+  `--data-dir` at the same directory).
 
 ## Developer Workflow
 

@@ -4,10 +4,14 @@ services:
       context: .
     ports:
       - "8080:8080"
+    # Config comes from a .env file next to this compose file (copy .env.example
+    # to .env and set your own token). Data lives in the named volume at
+    # ./data inside the container, so no command needs --data-dir.
     environment:
-      PROMAG_SERVER_TOKEN: ${PROMAG_SERVER_TOKEN:?set PROMAG_SERVER_TOKEN before starting the cloud hub}
+      PROMAG_SERVER_TOKEN: ${PROMAG_SERVER_TOKEN:?set PROMAG_SERVER_TOKEN in .env (see .env.example)}
+      PROMAG_PUBLIC_URL: ${PROMAG_PUBLIC_URL:-}
     volumes:
-      - promag-cloud-data:/data
+      - promag-cloud-data:/app/data
     restart: unless-stopped
 
 volumes:

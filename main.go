@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,8 @@ const (
 	configUpdatedByKey = "config_updated_by"
 	remoteTokenEnv     = "PROMAG_REMOTE_TOKEN"
 	remoteActorEnv     = "PROMAG_REMOTE_ACTOR"
+	publicURLEnv       = "PROMAG_PUBLIC_URL"
+	cloudEnvFile       = "promag.env"
 	remoteRefreshEvery = 5 * time.Second
 	activeUserWindow   = 30 * time.Second
 	dateLayout         = "2006-01-02"
@@ -192,9 +195,14 @@ type projectRecord struct {
 	Type            projectType
 	RemoteURL       string
 	AccessTokenHash string
-	DBPath          string
-	CreatedAt       time.Time
-	LastOpenedAt    time.Time
+	// RemoteToken is the access token a remote project uses to authenticate
+	// with its server. It is stored locally so clients do not need to set the
+	// PROMAG_REMOTE_TOKEN environment variable. It is never sent to API
+	// clients (exportProjectRecord omits it).
+	RemoteToken  string
+	DBPath       string
+	CreatedAt    time.Time
+	LastOpenedAt time.Time
 }
 
 type projectAccessToken struct {
@@ -495,11 +503,14 @@ func main() {
 	cloudTokenLabelFlag := flag.String("token-label", "", "label for tokens created by --cloud-create, --cloud-import, or --cloud-token")
 	cloudListTokensFlag := flag.String("cloud-tokens", "", "list cloud project access tokens: --cloud-tokens <project-id-or-name>")
 	cloudRevokeTokenFlag := flag.String("cloud-revoke-token", "", "revoke a cloud project access token by token ID")
+	cloudInitFlag := flag.Bool("cloud-init", false, "write the cloud config file (admin token + public URL) into the data directory; generates a token if none is set")
+	cloudAdminFlag := flag.Bool("cloud-admin", false, "open the interactive cloud admin TUI to manage projects and per-user tokens")
 	cloudBackupFlag := flag.String("cloud-backup", "", "back up all cloud projects to JSON: --cloud-backup <output-path.json>")
 	cloudRestoreFlag := flag.String("cloud-restore", "", "restore all cloud projects from JSON into an empty cloud data directory: --cloud-restore <input-path.json>")
-	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", ".promag-cloud"), "data directory for cloud commands")
+	cloudDataDirFlag := flag.String("data-dir", filepath.Join(".", "data"), "data directory for cloud commands; defaults to ./data")
 	serveAddrFlag := flag.String("addr", ":8080", "address for --serve")
 	serveTokenFlag := flag.String("token", "", "bearer token for --serve or --cloud; can also use PROMAG_SERVER_TOKEN")
+	publicURLFlag := flag.String("public-url", "", "public base URL used in printed connection strings, e.g. https://promag.example.com")
 	flag.Parse()
 
 	mouseDebugLogPath = strings.TrimSpace(os.Getenv("PROMAG_DEBUG_MOUSE"))
@@ -511,6 +522,8 @@ func main() {
 	cloudActionCount := 0
 	for _, active := range []bool{
 		*cloudFlag,
+		*cloudInitFlag,
+		*cloudAdminFlag,
 		*cloudCreateFlag,
 		*cloudImportFlag,
 		strings.TrimSpace(*cloudTokenFlag) != "",
@@ -524,7 +537,7 @@ func main() {
 		}
 	}
 	if cloudActionCount > 1 {
-		fmt.Fprintln(os.Stderr, "--cloud, --cloud-create, --cloud-import, --cloud-token, --cloud-tokens, --cloud-revoke-token, --cloud-backup, and --cloud-restore cannot be used together")
+		fmt.Fprintln(os.Stderr, "--cloud, --cloud-init, --cloud-admin, --cloud-create, --cloud-import, --cloud-token, --cloud-tokens, --cloud-revoke-token, --cloud-backup, and --cloud-restore cannot be used together")
 		os.Exit(1)
 	}
 	if cloudActionCount > 0 {
@@ -534,6 +547,54 @@ func main() {
 		}
 		cloudRegistryPath := filepath.Join(*cloudDataDirFlag, registryFile)
 		cloudProjectsBaseDir := filepath.Join(*cloudDataDirFlag, projectsDir)
+
+		// Configuration (admin token + public URL) is read from a file kept in
+		// the data directory (the persistent volume), so it does not have to be
+		// exported or passed on every command. Explicit flags and real
+		// environment variables still take precedence over the file.
+		cloudConfig, err := loadCloudConfigFile(*cloudDataDirFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load cloud config: %v\n", err)
+			os.Exit(1)
+		}
+		serverToken := firstNonEmpty(*serveTokenFlag, os.Getenv("PROMAG_SERVER_TOKEN"), cloudConfig["PROMAG_SERVER_TOKEN"])
+		publicBaseURL := cloudPublicBaseURL(firstNonEmpty(*publicURLFlag, os.Getenv(publicURLEnv), cloudConfig["PROMAG_PUBLIC_URL"]), *serveAddrFlag)
+
+		if *cloudInitFlag {
+			token := serverToken
+			generated := false
+			if token == "" {
+				token, err = newAccessToken()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "generate admin token: %v\n", err)
+					os.Exit(1)
+				}
+				generated = true
+			}
+			cloudConfig["PROMAG_SERVER_TOKEN"] = token
+			if publicURL := firstNonEmpty(*publicURLFlag, os.Getenv(publicURLEnv), cloudConfig["PROMAG_PUBLIC_URL"]); publicURL != "" {
+				cloudConfig["PROMAG_PUBLIC_URL"] = strings.TrimRight(publicURL, "/")
+			}
+			if err := writeCloudConfigFile(*cloudDataDirFlag, cloudConfig); err != nil {
+				fmt.Fprintf(os.Stderr, "write cloud config: %v\n", err)
+				os.Exit(1)
+			}
+			configPath := filepath.Join(*cloudDataDirFlag, cloudEnvFile)
+			fmt.Fprintf(os.Stdout, "Cloud config written to %s\n", configPath)
+			if generated {
+				fmt.Fprintf(os.Stdout, "Generated admin token: %s\n", token)
+				fmt.Fprintln(os.Stdout, "Keep it safe; it is stored in the config file and shown here only once.")
+			} else {
+				fmt.Fprintln(os.Stdout, "Reused the existing admin token.")
+			}
+			if cloudConfig["PROMAG_PUBLIC_URL"] == "" {
+				fmt.Fprintln(os.Stdout, "No public URL set. Re-run with --public-url https://your-host so connection strings use your real address.")
+			} else {
+				fmt.Fprintf(os.Stdout, "Public URL: %s\n", cloudConfig["PROMAG_PUBLIC_URL"])
+			}
+			return
+		}
+
 		projects, _, err := loadProjectRegistry(cloudRegistryPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "load cloud project registry: %v\n", err)
@@ -555,10 +616,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stdout, "Created cloud project %q (%s)\n", project.Name, project.ID)
-			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
-			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
-			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			printCloudProjectCredentials("Created cloud project", project, tokenRecord, projectToken, publicBaseURL)
 			return
 		}
 		if *cloudImportFlag {
@@ -577,10 +635,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stdout, "Imported cloud project %q (%s)\n", project.Name, project.ID)
-			fmt.Fprintf(os.Stdout, "Remote URL: http://%s/projects/%s\n", displayAddr(*serveAddrFlag), project.ID)
-			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
-			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			printCloudProjectCredentials("Imported cloud project", project, tokenRecord, projectToken, publicBaseURL)
 			return
 		}
 		if strings.TrimSpace(*cloudTokenFlag) != "" {
@@ -594,9 +649,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "create cloud project token: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stdout, "Created cloud project token for %q (%s)\n", project.Name, project.ID)
-			fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
-			fmt.Fprintf(os.Stdout, "Project token: %s\n", projectToken)
+			printCloudProjectCredentials("Created cloud project token for", project, tokenRecord, projectToken, publicBaseURL)
 			return
 		}
 		if strings.TrimSpace(*cloudListTokensFlag) != "" {
@@ -629,6 +682,13 @@ func main() {
 			fmt.Fprintf(os.Stdout, "Revoked cloud project token %s (%s)\n", tokenRecord.ID, fallback(tokenRecord.Label, "unlabeled"))
 			return
 		}
+		if *cloudAdminFlag {
+			if err := runCloudAdmin(cloudRegistryPath, cloudProjectsBaseDir, publicBaseURL); err != nil {
+				fmt.Fprintf(os.Stderr, "cloud admin: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		if strings.TrimSpace(*cloudBackupFlag) != "" {
 			if err := backupCloudProjects(cloudRegistryPath, *cloudBackupFlag); err != nil {
 				fmt.Fprintf(os.Stderr, "backup cloud projects: %v\n", err)
@@ -646,15 +706,11 @@ func main() {
 			fmt.Fprintf(os.Stdout, "Restored %d cloud project(s) from %s\n", restored, *cloudRestoreFlag)
 			return
 		}
-		token := strings.TrimSpace(*serveTokenFlag)
-		if token == "" {
-			token = strings.TrimSpace(os.Getenv("PROMAG_SERVER_TOKEN"))
-		}
-		if token == "" {
-			fmt.Fprintln(os.Stderr, "cloud token is required: use --token or PROMAG_SERVER_TOKEN")
+		if serverToken == "" {
+			fmt.Fprintln(os.Stderr, "cloud token is required: run promag --cloud-init, or set PROMAG_SERVER_TOKEN / --token")
 			os.Exit(1)
 		}
-		if err := serveCloud(cloudRegistryPath, cloudProjectsBaseDir, *serveAddrFlag, token); err != nil {
+		if err := serveCloud(cloudRegistryPath, cloudProjectsBaseDir, *serveAddrFlag, serverToken); err != nil {
 			fmt.Fprintf(os.Stderr, "serve cloud: %v\n", err)
 			os.Exit(1)
 		}
@@ -857,17 +913,19 @@ func newModel(registryPath, projectsBaseDir string, project projectRecord, proje
 	noteInput.SetHeight(14)
 	noteInput.Focus()
 
-	projectInputs := make([]textinput.Model, 3)
+	projectInputs := make([]textinput.Model, 4)
 	projectPlaceholders := []string{
-		"Project name",
+		"Project name (or paste a connection string here)",
 		"Type: local or remote",
-		"Remote URL (required for remote)",
+		"Remote URL (or paste a connection string)",
+		"Token (auto-filled from a connection string)",
 	}
 	for i := range projectInputs {
 		in := textinput.New()
 		in.Placeholder = projectPlaceholders[i]
 		in.Prompt = ""
-		in.CharLimit = 256
+		// Connection strings are long; allow pasting one into any field.
+		in.CharLimit = 1024
 		projectInputs[i] = in
 	}
 
@@ -1933,7 +1991,7 @@ func (m model) renderOverlay() string {
 	case overlayProjects:
 		if m.projectCreate {
 			title := "Create Project"
-			subtitle := "Name the project, choose local or remote, then save. esc cancels unless this is first launch."
+			subtitle := "To join a shared project, paste the connection string from your admin into Name and save. Or type a name and choose local/remote. esc cancels unless this is first launch."
 			if m.editingProjectID != "" {
 				title = "Edit Project"
 				subtitle = "Update the project details, then save. esc returns to the project list."
@@ -1943,14 +2001,14 @@ func (m model) renderOverlay() string {
 				ui.subtitle.Render(subtitle),
 				"",
 			}
-			labels := []string{"Name", "Type", "Remote URL"}
+			labels := []string{"Name", "Type", "Remote URL", "Token"}
 			for i := 0; i < m.projectFieldCount(); i++ {
 				lines = append(lines, m.formLabel(labels[i], i == m.formCursor))
 				lines = append(lines, m.projectInputs[i].View())
 			}
 			if normalizeProjectType(m.projectInputs[1].Value()) == projectTypeRemote {
 				lines = append(lines, "")
-				lines = append(lines, ui.subtitle.Render("Remote projects still use a local cache DB for now."))
+				lines = append(lines, ui.subtitle.Render("Token is stored locally so you don't need PROMAG_REMOTE_TOKEN. A local cache DB keeps the project visible offline."))
 			}
 			return bg.Render(strings.Join(lines, "\n"))
 		}
@@ -2377,6 +2435,7 @@ func (m *model) openProjectEditForm(project projectRecord) {
 	m.projectInputs[0].SetValue(project.Name)
 	m.projectInputs[1].SetValue(string(project.Type))
 	m.projectInputs[2].SetValue(project.RemoteURL)
+	m.projectInputs[3].SetValue(project.RemoteToken)
 	m.projectInputs[0].Focus()
 }
 
@@ -2623,22 +2682,40 @@ func (m *model) submitFilterForm() error {
 
 func (m *model) submitProjectForm() (projectRecord, error) {
 	name := strings.TrimSpace(m.projectInputs[0].Value())
+	kind := normalizeProjectType(m.projectInputs[1].Value())
+	remoteURL := strings.TrimSpace(m.projectInputs[2].Value())
+	remoteToken := strings.TrimSpace(m.projectInputs[3].Value())
+
+	// A teammate can paste a single connection string into any field. When we
+	// recognize one, it becomes the source of truth: the project is remote and
+	// the URL, token, and (when not already typed) name come from the invite.
+	for _, candidate := range []string{remoteURL, remoteToken, name} {
+		if invite, ok := parseRemoteInvite(candidate); ok {
+			kind = projectTypeRemote
+			remoteURL = invite.URL
+			remoteToken = invite.Token
+			if name == "" || looksLikeRemoteInvite(name) {
+				name = invite.Name
+			}
+			break
+		}
+	}
+
 	if name == "" {
 		return projectRecord{}, errors.New("project name is required")
 	}
-	kind := normalizeProjectType(m.projectInputs[1].Value())
 	if kind == "" {
 		return projectRecord{}, errors.New("project type must be local or remote")
 	}
-	remoteURL := strings.TrimSpace(m.projectInputs[2].Value())
 	if kind == projectTypeRemote && remoteURL == "" {
-		return projectRecord{}, errors.New("remote_url is required for remote projects")
+		return projectRecord{}, errors.New("remote URL is required for remote projects (paste the connection string from your admin)")
 	}
 	if kind == projectTypeLocal {
 		remoteURL = ""
+		remoteToken = ""
 	}
 	if m.editingProjectID != "" {
-		project, err := updateProjectRecord(m.registryPath, m.editingProjectID, name, kind, remoteURL)
+		project, err := updateProjectRecord(m.registryPath, m.editingProjectID, name, kind, remoteURL, remoteToken)
 		if err != nil {
 			return projectRecord{}, err
 		}
@@ -2652,7 +2729,7 @@ func (m *model) submitProjectForm() (projectRecord, error) {
 		}
 		return project, nil
 	}
-	project, err := createProjectRecord(m.registryPath, m.projectsBaseDir, name, kind, remoteURL)
+	project, err := createProjectRecord(m.registryPath, m.projectsBaseDir, name, kind, remoteURL, remoteToken)
 	if err != nil {
 		return projectRecord{}, err
 	}
@@ -2723,7 +2800,7 @@ func (m model) projectIndex(id string) int {
 
 func (m model) projectFieldCount() int {
 	if normalizeProjectType(m.projectInputs[1].Value()) == projectTypeRemote {
-		return 3
+		return 4
 	}
 	return 2
 }
@@ -4458,12 +4535,18 @@ func newRemoteProjectClient(project projectRecord) (remoteProjectClient, error) 
 	if baseURL == "" {
 		return remoteProjectClient{}, errors.New("remote project URL is required")
 	}
-	token := strings.TrimSpace(os.Getenv(remoteTokenEnv))
+	// Prefer the token stored with the project (from a pasted connection
+	// string). Environment variables remain as an override for advanced setups
+	// and for projects created before tokens were stored locally.
+	token := strings.TrimSpace(project.RemoteToken)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv(remoteTokenEnv))
+	}
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("PROMAG_SERVER_TOKEN"))
 	}
 	if token == "" {
-		return remoteProjectClient{}, fmt.Errorf("remote token is required: set %s or PROMAG_SERVER_TOKEN", remoteTokenEnv)
+		return remoteProjectClient{}, fmt.Errorf("remote token is required: paste the connection string from your admin, or set %s", remoteTokenEnv)
 	}
 	actorID := strings.TrimSpace(os.Getenv(remoteActorEnv))
 	if actorID == "" {
@@ -6181,7 +6264,7 @@ func loadProjectRegistry(path string) ([]projectRecord, string, error) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`SELECT id, name, type, remote_url, access_token_hash, db_path, created_at, last_opened_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, lower(name) ASC`)
+	rows, err := db.Query(`SELECT id, name, type, remote_url, access_token_hash, remote_token, db_path, created_at, last_opened_at FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, lower(name) ASC`)
 	if err != nil {
 		return nil, "", err
 	}
@@ -6195,7 +6278,7 @@ func loadProjectRegistry(path string) ([]projectRecord, string, error) {
 			createdAt    string
 			lastOpenedAt string
 		)
-		if err := rows.Scan(&project.ID, &project.Name, &projectTypeV, &project.RemoteURL, &project.AccessTokenHash, &project.DBPath, &createdAt, &lastOpenedAt); err != nil {
+		if err := rows.Scan(&project.ID, &project.Name, &projectTypeV, &project.RemoteURL, &project.AccessTokenHash, &project.RemoteToken, &project.DBPath, &createdAt, &lastOpenedAt); err != nil {
 			return nil, "", err
 		}
 		project.Type = normalizeProjectType(projectTypeV)
@@ -6237,7 +6320,7 @@ func bootstrapDefaultProject(registryPath, projectsBaseDir string, projects []pr
 		return projects, lastProjectID, nil
 	}
 
-	project, err := createProjectRecord(registryPath, projectsBaseDir, "Default Project", projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, "Default Project", projectTypeLocal, "", "")
 	if err != nil {
 		return nil, "", err
 	}
@@ -6373,7 +6456,7 @@ func importProjectBundle(registryPath, projectsBaseDir string, projects []projec
 }
 
 func createProjectFromBundle(registryPath, projectsBaseDir, name string, bundle projectExportBundle) (projectRecord, error) {
-	project, err := createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
+	project, err := createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "", "")
 	if err != nil {
 		return projectRecord{}, err
 	}
@@ -6527,7 +6610,7 @@ func createCloudProject(registryPath, projectsBaseDir string, projects []project
 	if projectNameExists(projects, name) {
 		return projectRecord{}, fmt.Errorf("project %q already exists", name)
 	}
-	return createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "")
+	return createProjectRecord(registryPath, projectsBaseDir, name, projectTypeLocal, "", "")
 }
 
 func rotateProjectAccessToken(registryPath, projectID string) (projectRecord, string, error) {
@@ -6775,6 +6858,156 @@ func newAccessToken() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
+// remoteInviteScheme prefixes a connection string. A teammate copies the whole
+// string and pastes it into the project form; ProMag fills in the remote URL,
+// token, and a suggested name, so there is nothing to assemble by hand.
+const remoteInviteScheme = "promag://join/"
+
+type remoteInvite struct {
+	Version int    `json:"v"`
+	URL     string `json:"url"`
+	Token   string `json:"token"`
+	Name    string `json:"name,omitempty"`
+}
+
+// encodeRemoteInvite packs a remote URL, token, and suggested name into a single
+// copy-pasteable connection string.
+func encodeRemoteInvite(remoteURL, token, name string) (string, error) {
+	invite := remoteInvite{
+		Version: 1,
+		URL:     strings.TrimRight(strings.TrimSpace(remoteURL), "/"),
+		Token:   strings.TrimSpace(token),
+		Name:    strings.TrimSpace(name),
+	}
+	if invite.URL == "" {
+		return "", errors.New("invite requires a remote URL")
+	}
+	data, err := json.Marshal(invite)
+	if err != nil {
+		return "", err
+	}
+	return remoteInviteScheme + base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+// looksLikeRemoteInvite reports whether a string is a connection string without
+// fully decoding it. Used to decide whether a pasted value should be treated as
+// an invite rather than a plain name or URL.
+func looksLikeRemoteInvite(value string) bool {
+	return strings.HasPrefix(strings.TrimSpace(value), remoteInviteScheme)
+}
+
+// parseRemoteInvite decodes a connection string. The second return value is
+// false when the input is not a valid invite, so callers can fall back to
+// treating the value as a plain remote URL.
+func parseRemoteInvite(value string) (remoteInvite, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, remoteInviteScheme) {
+		return remoteInvite{}, false
+	}
+	data, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, remoteInviteScheme))
+	if err != nil {
+		return remoteInvite{}, false
+	}
+	var invite remoteInvite
+	if err := json.Unmarshal(data, &invite); err != nil {
+		return remoteInvite{}, false
+	}
+	invite.URL = strings.TrimRight(strings.TrimSpace(invite.URL), "/")
+	invite.Token = strings.TrimSpace(invite.Token)
+	invite.Name = strings.TrimSpace(invite.Name)
+	if invite.URL == "" {
+		return remoteInvite{}, false
+	}
+	return invite, true
+}
+
+// cloudPublicBaseURL returns the externally reachable base URL used when
+// printing invites. The hub cannot know its own public host, so --public-url
+// overrides the address-derived default.
+func cloudPublicBaseURL(publicURL, addr string) string {
+	if trimmed := strings.TrimSpace(publicURL); trimmed != "" {
+		return strings.TrimRight(trimmed, "/")
+	}
+	return "http://" + displayAddr(addr)
+}
+
+func cloudProjectRemoteURL(baseURL, projectID string) string {
+	return strings.TrimRight(baseURL, "/") + "/projects/" + projectID
+}
+
+// firstNonEmpty returns the first argument that is non-empty after trimming.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// loadCloudConfigFile reads KEY=VALUE pairs from <dataDir>/promag.env. A missing
+// file is not an error — configuration is optional and can still come from flags
+// or the environment. Blank lines and lines starting with '#' are ignored, and
+// surrounding quotes on values are stripped.
+func loadCloudConfigFile(dataDir string) (map[string]string, error) {
+	values := map[string]string{}
+	data, err := os.ReadFile(filepath.Join(dataDir, cloudEnvFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return values, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key != "" {
+			values[key] = value
+		}
+	}
+	return values, nil
+}
+
+// writeCloudConfigFile persists the cloud config into the data directory. The
+// file holds the admin token, so it is written with 0600 permissions.
+func writeCloudConfigFile(dataDir string, values map[string]string) error {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString("# ProMag cloud hub configuration. Keep this file private; it holds the admin token.\n")
+	for _, key := range []string{"PROMAG_SERVER_TOKEN", "PROMAG_PUBLIC_URL"} {
+		if value := strings.TrimSpace(values[key]); value != "" {
+			fmt.Fprintf(&b, "%s=%s\n", key, value)
+		}
+	}
+	return os.WriteFile(filepath.Join(dataDir, cloudEnvFile), []byte(b.String()), 0o600)
+}
+
+// printCloudProjectCredentials writes the project URL, token, and a ready-to-share
+// connection string. The raw token is shown only once, so this is the moment to
+// hand the invite to a teammate.
+func printCloudProjectCredentials(headline string, project projectRecord, tokenRecord projectAccessToken, rawToken, baseURL string) {
+	remoteURL := cloudProjectRemoteURL(baseURL, project.ID)
+	fmt.Fprintf(os.Stdout, "%s %q (%s)\n", headline, project.Name, project.ID)
+	fmt.Fprintf(os.Stdout, "Remote URL: %s\n", remoteURL)
+	fmt.Fprintf(os.Stdout, "Project token ID: %s\n", tokenRecord.ID)
+	fmt.Fprintf(os.Stdout, "Project token: %s\n", rawToken)
+	if invite, err := encodeRemoteInvite(remoteURL, rawToken, project.Name); err == nil {
+		fmt.Fprintln(os.Stdout)
+		fmt.Fprintln(os.Stdout, "Connection string (share with one teammate; they paste it into ProMag):")
+		fmt.Fprintf(os.Stdout, "%s\n", invite)
+	}
+}
+
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -6904,7 +7137,7 @@ func projectNameExists(projects []projectRecord, name string) bool {
 	return false
 }
 
-func createProjectRecord(registryPath, projectsBaseDir, name string, kind projectType, remoteURL string) (projectRecord, error) {
+func createProjectRecord(registryPath, projectsBaseDir, name string, kind projectType, remoteURL, remoteToken string) (projectRecord, error) {
 	if err := os.MkdirAll(projectsBaseDir, 0o755); err != nil {
 		return projectRecord{}, err
 	}
@@ -6914,6 +7147,7 @@ func createProjectRecord(registryPath, projectsBaseDir, name string, kind projec
 		Name:         name,
 		Type:         kind,
 		RemoteURL:    remoteURL,
+		RemoteToken:  remoteToken,
 		DBPath:       filepath.Join(projectsBaseDir, nextID("db", now)+".sqlite3"),
 		CreatedAt:    now,
 		LastOpenedAt: now,
@@ -6950,12 +7184,13 @@ func insertProjectRecord(registryPath string, project projectRecord) error {
 
 func insertProjectRecordWithDB(db *sql.DB, project projectRecord) error {
 	_, err := db.Exec(
-		`INSERT INTO projects (id, name, type, remote_url, access_token_hash, db_path, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO projects (id, name, type, remote_url, access_token_hash, remote_token, db_path, created_at, last_opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		project.ID,
 		project.Name,
 		string(project.Type),
 		project.RemoteURL,
 		project.AccessTokenHash,
+		project.RemoteToken,
 		project.DBPath,
 		project.CreatedAt.Format(time.RFC3339Nano),
 		project.LastOpenedAt.Format(time.RFC3339Nano),
@@ -6963,7 +7198,7 @@ func insertProjectRecordWithDB(db *sql.DB, project projectRecord) error {
 	return err
 }
 
-func updateProjectRecord(registryPath, projectID, name string, kind projectType, remoteURL string) (projectRecord, error) {
+func updateProjectRecord(registryPath, projectID, name string, kind projectType, remoteURL, remoteToken string) (projectRecord, error) {
 	db, err := openProjectRegistry(registryPath)
 	if err != nil {
 		return projectRecord{}, err
@@ -6971,10 +7206,11 @@ func updateProjectRecord(registryPath, projectID, name string, kind projectType,
 	defer db.Close()
 
 	if _, err := db.Exec(
-		`UPDATE projects SET name = ?, type = ?, remote_url = ? WHERE id = ?`,
+		`UPDATE projects SET name = ?, type = ?, remote_url = ?, remote_token = ? WHERE id = ?`,
 		name,
 		string(kind),
 		remoteURL,
+		remoteToken,
 		projectID,
 	); err != nil {
 		return projectRecord{}, err
@@ -7023,6 +7259,7 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 			type TEXT NOT NULL,
 			remote_url TEXT NOT NULL,
 			access_token_hash TEXT NOT NULL DEFAULT '',
+			remote_token TEXT NOT NULL DEFAULT '',
 			db_path TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			last_opened_at TEXT NOT NULL
@@ -7051,14 +7288,24 @@ func openProjectRegistry(path string) (*sql.DB, error) {
 }
 
 func ensureProjectRegistrySchema(db *sql.DB) error {
-	ok, err := columnExists(db, "projects", "access_token_hash")
+	if err := ensureProjectColumn(db, "access_token_hash", `ALTER TABLE projects ADD COLUMN access_token_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureProjectColumn(db, "remote_token", `ALTER TABLE projects ADD COLUMN remote_token TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureProjectColumn(db *sql.DB, column, ddl string) error {
+	ok, err := columnExists(db, "projects", column)
 	if err != nil {
 		return err
 	}
 	if ok {
 		return nil
 	}
-	_, err = db.Exec(`ALTER TABLE projects ADD COLUMN access_token_hash TEXT NOT NULL DEFAULT ''`)
+	_, err = db.Exec(ddl)
 	return err
 }
 

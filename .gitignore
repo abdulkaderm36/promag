@@ -3,6 +3,11 @@
 *.sqlite3-shm
 .promag/
 .promag-cloud/
+/data/
+
+# Cloud config (contains the admin token)
+promag.env
+.env
 
 # Compiled binary (build artifact)
 /promag

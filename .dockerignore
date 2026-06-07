@@ -1,6 +1,8 @@
 .git
 .promag
 .promag-cloud
+data
+.env
 promag
 *.sqlite3
 *.sqlite3-*
